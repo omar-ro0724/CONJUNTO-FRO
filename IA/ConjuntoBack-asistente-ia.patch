@@ -1,0 +1,2167 @@
+diff --git a/.env.example b/.env.example
+index 56435a2..243b1fc 100644
+--- a/.env.example
++++ b/.env.example
+@@ -13,3 +13,13 @@ MERCADOPAGO_TEST_PAYER_EMAIL=test_user_co@testuser.com
+ # Opcional en local; en Render no hace falta (usa RENDER_EXTERNAL_URL)
+ # FRONTEND_BASE_URL=http://localhost:5173
+ # BACKEND_BASE_URL=http://localhost:8080
++
++# Asistente IA
++# Opcion A (Claude): IA_PROVEEDOR=anthropic, IA_API_KEY=sk-ant-..., IA_MODELO=claude-haiku-5-5
++# Opcion B (Gemini gratis): IA_PROVEEDOR=openai, IA_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai, IA_MODELO=gemini-2.5-flash
++# Opcion C (OpenAI): IA_PROVEEDOR=openai, IA_MODELO=gpt-4o-mini
++IA_PROVEEDOR=anthropic
++IA_API_KEY=
++IA_MODELO=
++IA_BASE_URL=
++IA_NOMBRE_CONJUNTO=Conjunto Residencial
+diff --git a/docs/ASISTENTE_IA.md b/docs/ASISTENTE_IA.md
+new file mode 100644
+index 0000000..969c7ed
+--- /dev/null
++++ b/docs/ASISTENTE_IA.md
+@@ -0,0 +1,51 @@
++# Asistente IA y gestión inteligente
++
++## Qué incluye
++
++| Función | Quién la usa | Endpoint |
++|---|---|---|
++| Chat con acceso a la base de datos | Residente, celador, administrador | `POST /api/ia/chat` |
++| Historial de conversaciones | Todos (solo las propias) | `GET /api/ia/conversaciones`, `GET /api/ia/conversaciones/{id}/mensajes`, `DELETE /api/ia/conversaciones/{id}` |
++| Calificar respuestas (aprendizaje) | Todos | `POST /api/ia/mensajes/{id}/feedback` `{ "util": true }` |
++| Base de conocimiento | Administrador | `GET/POST /api/ia/conocimiento`, `PUT /api/ia/conocimiento/{id}`, `PUT .../aprobar`, `PUT .../rechazar`, `DELETE` |
++| Respuestas mal calificadas | Administrador | `GET /api/ia/feedback/negativos` |
++| Resumen ejecutivo del conjunto | Administrador | `GET /api/ia/gestion/resumen` |
++| Redacción de comunicados | Administrador | `POST /api/ia/comunicados/redactar` `{ "tema", "tono", "detalles" }` |
++| Clasificar y priorizar una queja | Administrador, celador | `POST /api/ia/quejas/{id}/analizar` |
++| Estado del asistente | Todos | `GET /api/ia/estado` |
++
++Cada queja nueva se analiza automáticamente en segundo plano: categoría, prioridad (ALTA/MEDIA/BAJA), resumen y respuesta sugerida (`prioridadIA`, `categoriaIA`, `resumenIA`, `respuestaSugeridaIA`).
++
++## Cómo consulta la base de datos
++
++El modelo no ejecuta SQL. Usa herramientas definidas en `IA/HerramientasIA.java` y cada herramienta filtra por el rol del usuario autenticado:
++
++- Residente: solo sus quejas, pagos, paquetes, mascotas y accesos de su apartamento. Las reservas de otros aparecen sin nombre.
++- Celador: todo lo operativo (paquetes, accesos, reservas, quejas, mascotas, residentes), sin pagos.
++- Administrador: todo, incluidos pagos, mora y resumen del conjunto.
++
++## Cómo aprende (auto-entrenamiento)
++
++No se reentrena el modelo; el asistente acumula conocimiento propio del conjunto en la tabla `conocimiento_ia` y lo recupera en cada pregunta:
++
++1. Al arrancar se siembran las reglas reales de reservas, pagos, quejas, paquetería y accesos.
++2. Cuando alguien enseña una norma o dato general en el chat, el asistente lo guarda. Si lo enseña el administrador queda aprobado; si lo enseña otro rol queda pendiente.
++3. Cuando un usuario califica una respuesta como útil y esa respuesta no usó datos personales, la pareja pregunta/respuesta se propone como conocimiento pendiente.
++4. El administrador aprueba o rechaza en la app (Gestión IA > Conocimiento) y responde las preguntas mal calificadas (Gestión IA > Mejorar).
++5. Cada conversación conserva sus últimos 20 mensajes como memoria de contexto.
++
++Nada aprendido de residentes llega a otros usuarios sin aprobación, para evitar filtrar datos privados o información incorrecta.
++
++## Configuración (variables de entorno)
++
++| Variable | Ejemplo | Descripción |
++|---|---|---|
++| `IA_PROVEEDOR` | `anthropic` u `openai` | `openai` sirve para cualquier API compatible (OpenAI, Gemini, Groq, Ollama) |
++| `IA_API_KEY` | | Clave del proveedor. Sin clave el asistente funciona en modo básico con la base de conocimiento |
++| `IA_MODELO` | `claude-haiku-5-5`, `gpt-4o-mini`, `gemini-2.5-flash` | Modelo a usar |
++| `IA_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` | Solo para proveedores compatibles con OpenAI distintos de OpenAI |
++| `IA_NOMBRE_CONJUNTO` | `Conjunto Residencial Los Pinos` | Nombre usado por el asistente |
++| `IA_NOMBRE_ASISTENTE` | `Asistente del Conjunto` | Nombre del asistente |
++| `IA_LIMITE_MENSAJES_HORA` | `40` | Límite por usuario para controlar costos |
++
++En Render se agregan en Environment del servicio. Las tablas `conocimiento_ia`, `conversacion_ia`, `mensaje_ia` y las columnas nuevas de `queja` las crea Hibernate (`ddl-auto=update`).
+diff --git a/src/main/java/com/example/APP/AppApplication.java b/src/main/java/com/example/APP/AppApplication.java
+index acc3457..c2c68eb 100644
+--- a/src/main/java/com/example/APP/AppApplication.java
++++ b/src/main/java/com/example/APP/AppApplication.java
+@@ -51,6 +51,12 @@ public class AppApplication {
+ 		setPropertyFromDotenv(dotenv, "MERCADOPAGO_TEST_PAYER_EMAIL", "mercadopago.test-payer-email");
+ 		setPropertyFromDotenv(dotenv, "FRONTEND_BASE_URL", "app.frontend.base-url");
+ 		setPropertyFromDotenv(dotenv, "BACKEND_BASE_URL", "app.backend.base-url");
++		setPropertyFromDotenv(dotenv, "IA_PROVEEDOR", "ia.proveedor");
++		setPropertyFromDotenv(dotenv, "IA_API_KEY", "ia.api-key");
++		setPropertyFromDotenv(dotenv, "IA_MODELO", "ia.modelo");
++		setPropertyFromDotenv(dotenv, "IA_BASE_URL", "ia.base-url");
++		setPropertyFromDotenv(dotenv, "IA_NOMBRE_CONJUNTO", "ia.nombre-conjunto");
++		setPropertyFromDotenv(dotenv, "IA_NOMBRE_ASISTENTE", "ia.nombre-asistente");
+ 
+ 		// Fallback para Hibernate (evita error "Unable to determine Dialect" durante debug)
+ 		if (System.getProperty("spring.jpa.database-platform") == null) {
+diff --git a/src/main/java/com/example/APP/Configuration/SecurityConfig.java b/src/main/java/com/example/APP/Configuration/SecurityConfig.java
+index 4e1824c..f665e69 100644
+--- a/src/main/java/com/example/APP/Configuration/SecurityConfig.java
++++ b/src/main/java/com/example/APP/Configuration/SecurityConfig.java
+@@ -97,6 +97,10 @@ public class SecurityConfig {
+                                 "/api/pagos/residente/pagos",
+                                 "/api/pagos/sandbox-instrucciones"
+                         ).hasRole("RESIDENTE")
++                        .requestMatchers("/api/ia/conocimiento/**", "/api/ia/gestion/**", "/api/ia/feedback/**", "/api/ia/comunicados/**")
++                        .hasRole("ADMINISTRADOR")
++                        .requestMatchers(HttpMethod.POST, "/api/ia/quejas/*/analizar").hasAnyRole("ADMINISTRADOR", "CELADOR")
++                        .requestMatchers("/api/ia/**").hasAnyRole("ADMINISTRADOR", "CELADOR", "RESIDENTE")
+                         .requestMatchers("/api/**").authenticated()
+                         .anyRequest().permitAll()
+                 )
+diff --git a/src/main/java/com/example/APP/Controller/IaController.java b/src/main/java/com/example/APP/Controller/IaController.java
+new file mode 100644
+index 0000000..c499489
+--- /dev/null
++++ b/src/main/java/com/example/APP/Controller/IaController.java
+@@ -0,0 +1,139 @@
++package com.example.APP.Controller;
++
++import com.example.APP.Model.ConocimientoIA;
++import com.example.APP.Model.MensajeIA;
++import com.example.APP.Model.Queja;
++import com.example.APP.Model.Usuario;
++import com.example.APP.Repository.UsuarioRepository;
++import com.example.APP.Service.ConocimientoIAService;
++import com.example.APP.Service.IaChatService;
++import com.example.APP.Service.IaGestionService;
++import org.springframework.http.ResponseEntity;
++import org.springframework.security.access.prepost.PreAuthorize;
++import org.springframework.security.core.Authentication;
++import org.springframework.web.bind.annotation.*;
++
++import java.util.List;
++import java.util.Map;
++
++@RestController
++@RequestMapping("/api/ia")
++@CrossOrigin(originPatterns = "*", allowCredentials = "true")
++public class IaController {
++
++    private final IaChatService chatService;
++    private final IaGestionService gestionService;
++    private final ConocimientoIAService conocimientoService;
++    private final UsuarioRepository usuarioRepository;
++
++    public IaController(IaChatService chatService, IaGestionService gestionService,
++                        ConocimientoIAService conocimientoService, UsuarioRepository usuarioRepository) {
++        this.chatService = chatService;
++        this.gestionService = gestionService;
++        this.conocimientoService = conocimientoService;
++        this.usuarioRepository = usuarioRepository;
++    }
++
++    @GetMapping("/estado")
++    public Map<String, Object> estado() {
++        return chatService.estado();
++    }
++
++    @PostMapping("/chat")
++    public Map<String, Object> chat(@RequestBody Map<String, Object> payload, Authentication auth) {
++        Object id = payload.get("conversacionId");
++        Long conversacionId = id == null || id.toString().isBlank() ? null : Long.valueOf(id.toString().replace(".0", ""));
++        return chatService.chat(auth.getName(), conversacionId, texto(payload, "mensaje"));
++    }
++
++    @GetMapping("/conversaciones")
++    public List<Map<String, Object>> conversaciones(Authentication auth) {
++        return chatService.conversaciones(auth.getName());
++    }
++
++    @GetMapping("/conversaciones/{id}/mensajes")
++    public List<MensajeIA> mensajes(@PathVariable Long id, Authentication auth) {
++        return chatService.mensajes(auth.getName(), id);
++    }
++
++    @DeleteMapping("/conversaciones/{id}")
++    public ResponseEntity<Void> eliminarConversacion(@PathVariable Long id, Authentication auth) {
++        chatService.eliminarConversacion(auth.getName(), id);
++        return ResponseEntity.noContent().build();
++    }
++
++    @PostMapping("/mensajes/{id}/feedback")
++    public Map<String, Object> feedback(@PathVariable Long id, @RequestBody Map<String, Object> payload, Authentication auth) {
++        boolean util = Boolean.parseBoolean(String.valueOf(payload.getOrDefault("util", "false")));
++        return chatService.feedback(auth.getName(), id, util);
++    }
++
++    @GetMapping("/conocimiento")
++    @PreAuthorize("hasRole('ADMINISTRADOR')")
++    public List<ConocimientoIA> listarConocimiento(@RequestParam(name = "estado", required = false) String estado) {
++        return conocimientoService.listar(estado);
++    }
++
++    @PostMapping("/conocimiento")
++    @PreAuthorize("hasRole('ADMINISTRADOR')")
++    public ConocimientoIA crearConocimiento(@RequestBody Map<String, Object> payload, Authentication auth) {
++        Usuario admin = usuarioRepository.findByUsuario(auth.getName())
++                .orElseThrow(() -> new IllegalArgumentException("Usuario no encontrado"));
++        return conocimientoService.registrar(texto(payload, "titulo"), texto(payload, "contenido"),
++                texto(payload, "categoria"), admin, ConocimientoIA.Origen.ADMINISTRADOR);
++    }
++
++    @PutMapping("/conocimiento/{id}")
++    @PreAuthorize("hasRole('ADMINISTRADOR')")
++    public ConocimientoIA actualizarConocimiento(@PathVariable Long id, @RequestBody Map<String, Object> payload) {
++        return conocimientoService.actualizar(id, payload);
++    }
++
++    @PutMapping("/conocimiento/{id}/aprobar")
++    @PreAuthorize("hasRole('ADMINISTRADOR')")
++    public ConocimientoIA aprobar(@PathVariable Long id) {
++        return conocimientoService.cambiarEstado(id, ConocimientoIA.Estado.APROBADO);
++    }
++
++    @PutMapping("/conocimiento/{id}/rechazar")
++    @PreAuthorize("hasRole('ADMINISTRADOR')")
++    public ConocimientoIA rechazar(@PathVariable Long id) {
++        return conocimientoService.cambiarEstado(id, ConocimientoIA.Estado.RECHAZADO);
++    }
++
++    @DeleteMapping("/conocimiento/{id}")
++    @PreAuthorize("hasRole('ADMINISTRADOR')")
++    public ResponseEntity<Void> eliminarConocimiento(@PathVariable Long id) {
++        conocimientoService.eliminar(id);
++        return ResponseEntity.noContent().build();
++    }
++
++    @GetMapping("/feedback/negativos")
++    @PreAuthorize("hasRole('ADMINISTRADOR')")
++    public List<Map<String, Object>> respuestasMalCalificadas() {
++        return chatService.respuestasMalCalificadas();
++    }
++
++    @GetMapping("/gestion/resumen")
++    @PreAuthorize("hasRole('ADMINISTRADOR')")
++    public Map<String, Object> resumenGestion() {
++        return gestionService.resumenGestion();
++    }
++
++    @PostMapping("/comunicados/redactar")
++    @PreAuthorize("hasRole('ADMINISTRADOR')")
++    public Map<String, Object> redactarComunicado(@RequestBody Map<String, Object> payload) {
++        return gestionService.redactarComunicado(texto(payload, "tema"), texto(payload, "tono"), texto(payload, "detalles"));
++    }
++
++    @PostMapping("/quejas/{id}/analizar")
++    @PreAuthorize("hasAnyRole('ADMINISTRADOR', 'CELADOR')")
++    public Queja analizarQueja(@PathVariable Long id) {
++        return gestionService.analizarQueja(id);
++    }
++
++    private String texto(Map<String, Object> payload, String clave) {
++        Object v = payload.get(clave);
++        return v == null ? null : v.toString();
++    }
++}
+diff --git a/src/main/java/com/example/APP/IA/AnthropicLlmClient.java b/src/main/java/com/example/APP/IA/AnthropicLlmClient.java
+new file mode 100644
+index 0000000..88c6479
+--- /dev/null
++++ b/src/main/java/com/example/APP/IA/AnthropicLlmClient.java
+@@ -0,0 +1,120 @@
++package com.example.APP.IA;
++
++import org.springframework.http.HttpEntity;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.web.client.RestTemplate;
++
++import java.util.*;
++import java.util.function.Function;
++
++public class AnthropicLlmClient implements LlmClient {
++
++    private static final int MAX_ITERACIONES = 6;
++
++    private final RestTemplate restTemplate;
++    private final String apiKey;
++    private final String modelo;
++    private final String baseUrl;
++    private final int maxTokens;
++
++    public AnthropicLlmClient(RestTemplate restTemplate, String apiKey, String modelo, String baseUrl, int maxTokens) {
++        this.restTemplate = restTemplate;
++        this.apiKey = apiKey;
++        this.modelo = modelo;
++        this.baseUrl = (baseUrl == null || baseUrl.isBlank()) ? "https://api.anthropic.com" : baseUrl.replaceAll("/+$", "");
++        this.maxTokens = maxTokens;
++    }
++
++    @Override
++    public boolean disponible() {
++        return apiKey != null && !apiKey.isBlank();
++    }
++
++    @Override
++    public String proveedor() {
++        return "anthropic";
++    }
++
++    @Override
++    public String modelo() {
++        return modelo;
++    }
++
++    @Override
++    @SuppressWarnings("unchecked")
++    public ResultadoLlm conversar(String sistema, List<MensajeLlm> historial, List<DefinicionHerramienta> herramientas,
++                                  Function<LlamadaHerramienta, String> ejecutor) {
++        List<Map<String, Object>> mensajes = new ArrayList<>();
++        for (MensajeLlm m : historial) {
++            mensajes.add(new HashMap<>(Map.of("role", m.rol(), "content", m.contenido())));
++        }
++
++        List<Map<String, Object>> tools = new ArrayList<>();
++        for (DefinicionHerramienta h : herramientas) {
++            tools.add(Map.of("name", h.nombre(), "description", h.descripcion(), "input_schema", h.parametros()));
++        }
++
++        List<String> usadas = new ArrayList<>();
++        for (int i = 0; i < MAX_ITERACIONES; i++) {
++            Map<String, Object> cuerpo = new LinkedHashMap<>();
++            cuerpo.put("model", modelo);
++            cuerpo.put("max_tokens", maxTokens);
++            cuerpo.put("system", sistema);
++            cuerpo.put("messages", mensajes);
++            if (!tools.isEmpty()) {
++                cuerpo.put("tools", tools);
++            }
++
++            Map<String, Object> respuesta = restTemplate.postForObject(baseUrl + "/v1/messages",
++                    new HttpEntity<>(cuerpo, headers()), Map.class);
++            if (respuesta == null) {
++                throw new IllegalStateException("Respuesta vacía del proveedor de IA");
++            }
++
++            List<Map<String, Object>> contenido = (List<Map<String, Object>>) respuesta.getOrDefault("content", List.of());
++            String stopReason = String.valueOf(respuesta.get("stop_reason"));
++
++            if (!"tool_use".equals(stopReason)) {
++                return new ResultadoLlm(extraerTexto(contenido), usadas);
++            }
++
++            mensajes.add(new HashMap<>(Map.of("role", "assistant", "content", contenido)));
++            List<Map<String, Object>> resultados = new ArrayList<>();
++            for (Map<String, Object> bloque : contenido) {
++                if (!"tool_use".equals(bloque.get("type"))) {
++                    continue;
++                }
++                String nombre = String.valueOf(bloque.get("name"));
++                Map<String, Object> entrada = bloque.get("input") instanceof Map<?, ?> m
++                        ? (Map<String, Object>) m : Map.of();
++                usadas.add(nombre);
++                String salida = ejecutor.apply(new LlamadaHerramienta(nombre, entrada));
++                resultados.add(Map.of("type", "tool_result", "tool_use_id", bloque.get("id"), "content", salida));
++            }
++            mensajes.add(new HashMap<>(Map.of("role", "user", "content", resultados)));
++        }
++        return new ResultadoLlm("No pude completar la consulta en este momento. Intenta formularla de otra manera.", usadas);
++    }
++
++    private HttpHeaders headers() {
++        HttpHeaders headers = new HttpHeaders();
++        headers.setContentType(MediaType.APPLICATION_JSON);
++        headers.set("x-api-key", apiKey);
++        headers.set("anthropic-version", "2023-06-01");
++        return headers;
++    }
++
++    private String extraerTexto(List<Map<String, Object>> contenido) {
++        StringBuilder sb = new StringBuilder();
++        for (Map<String, Object> bloque : contenido) {
++            if ("text".equals(bloque.get("type")) && bloque.get("text") != null) {
++                if (!sb.isEmpty()) {
++                    sb.append("\n");
++                }
++                sb.append(bloque.get("text"));
++            }
++        }
++        return sb.toString().trim();
++    }
++}
+diff --git a/src/main/java/com/example/APP/IA/HerramientasIA.java b/src/main/java/com/example/APP/IA/HerramientasIA.java
+new file mode 100644
+index 0000000..1df405a
+--- /dev/null
++++ b/src/main/java/com/example/APP/IA/HerramientasIA.java
+@@ -0,0 +1,484 @@
++package com.example.APP.IA;
++
++import com.example.APP.IA.LlmClient.DefinicionHerramienta;
++import com.example.APP.IA.LlmClient.LlamadaHerramienta;
++import com.example.APP.Model.*;
++import com.example.APP.Repository.*;
++import com.example.APP.Service.ConocimientoIAService;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.SerializationFeature;
++import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.stereotype.Component;
++
++import java.time.LocalDate;
++import java.time.LocalDateTime;
++import java.time.YearMonth;
++import java.time.ZoneId;
++import java.util.*;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
++
++@Component
++public class HerramientasIA {
++
++    public static final ZoneId ZONA = ZoneId.of("America/Bogota");
++    private static final Logger log = LoggerFactory.getLogger(HerramientasIA.class);
++    private static final int LIMITE_DEFECTO = 15;
++    private static final int LIMITE_MAXIMO = 50;
++
++    private final UsuarioRepository usuarioRepository;
++    private final QuejaRepository quejaRepository;
++    private final PagoAdministracionRepository pagoRepository;
++    private final PaqueteriaRepository paqueteriaRepository;
++    private final ReservaZonaComunRepository reservaRepository;
++    private final AccesoVehicularRepository accesoVehicularRepository;
++    private final AccesoPeatonalRepository accesoPeatonalRepository;
++    private final MascotaRepository mascotaRepository;
++    private final ConocimientoIAService conocimientoService;
++    private final ObjectMapper json;
++
++    public HerramientasIA(UsuarioRepository usuarioRepository, QuejaRepository quejaRepository,
++                          PagoAdministracionRepository pagoRepository, PaqueteriaRepository paqueteriaRepository,
++                          ReservaZonaComunRepository reservaRepository,
++                          AccesoVehicularRepository accesoVehicularRepository,
++                          AccesoPeatonalRepository accesoPeatonalRepository, MascotaRepository mascotaRepository,
++                          ConocimientoIAService conocimientoService) {
++        this.usuarioRepository = usuarioRepository;
++        this.quejaRepository = quejaRepository;
++        this.pagoRepository = pagoRepository;
++        this.paqueteriaRepository = paqueteriaRepository;
++        this.reservaRepository = reservaRepository;
++        this.accesoVehicularRepository = accesoVehicularRepository;
++        this.accesoPeatonalRepository = accesoPeatonalRepository;
++        this.mascotaRepository = mascotaRepository;
++        this.conocimientoService = conocimientoService;
++        this.json = new ObjectMapper().registerModule(new JavaTimeModule())
++                .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
++    }
++
++    public List<DefinicionHerramienta> disponiblesPara(Usuario usuario) {
++        boolean admin = usuario.getRol() == Usuario.Rol.ADMINISTRADOR;
++        boolean staff = admin || usuario.getRol() == Usuario.Rol.CELADOR;
++        String alcance = staff ? "de todo el conjunto" : "del residente actual";
++
++        List<DefinicionHerramienta> lista = new ArrayList<>();
++        lista.add(new DefinicionHerramienta("buscar_conocimiento",
++                "Busca en la base de conocimiento del conjunto (reglamento, horarios, tarifas, procedimientos y respuestas aprendidas).",
++                esquema(Map.of("texto", prop("string", "Palabras clave a buscar")), "texto")));
++        lista.add(new DefinicionHerramienta("registrar_conocimiento",
++                "Guarda un dato GENERAL y reutilizable del conjunto que el usuario acaba de enseñar (norma, horario, tarifa, procedimiento). "
++                        + "Nunca guardes datos personales, montos individuales, nombres de residentes ni información privada.",
++                esquema(Map.of(
++                        "titulo", prop("string", "Título corto"),
++                        "contenido", prop("string", "Dato a recordar redactado de forma clara y general"),
++                        "categoria", propEnum("Categoría", "RESERVAS", "PAGOS", "QUEJAS", "PAQUETERIA", "ACCESOS", "MASCOTAS", "CONVIVENCIA", "GENERAL")
++                ), "titulo", "contenido")));
++        lista.add(new DefinicionHerramienta("consultar_quejas",
++                "Consulta quejas " + alcance + ". Permite filtrar por estado y categoría.",
++                esquema(Map.of(
++                        "estado", propEnum("Estado", "PENDIENTE", "EN_PROCESO", "RESUELTO"),
++                        "categoria", prop("string", "Tipo de queja, por ejemplo RUIDO o MASCOTA"),
++                        "limite", prop("integer", "Máximo de registros")
++                ))));
++        lista.add(new DefinicionHerramienta("consultar_paqueteria",
++                "Consulta paquetes " + alcance + ".",
++                esquema(Map.of(
++                        "estado", propEnum("Estado", "PENDIENTE", "ENTREGADO"),
++                        "torre", prop("string", "Torre (solo personal)"),
++                        "limite", prop("integer", "Máximo de registros")
++                ))));
++        lista.add(new DefinicionHerramienta("consultar_reservas",
++                "Consulta reservas de zonas comunes en un rango de fechas para conocer ocupación y disponibilidad.",
++                esquema(Map.of(
++                        "zona", propEnum("Zona común", "piscina", "gimnasio", "salon comunal", "zona bbq"),
++                        "desde", prop("string", "Fecha inicial yyyy-MM-dd (por defecto hoy)"),
++                        "hasta", prop("string", "Fecha final yyyy-MM-dd (por defecto 7 días después)")
++                ))));
++        lista.add(new DefinicionHerramienta("consultar_accesos",
++                "Consulta ingresos peatonales y vehiculares " + alcance + ".",
++                esquema(Map.of(
++                        "fecha", prop("string", "Fecha yyyy-MM-dd (por defecto hoy)"),
++                        "tipo", propEnum("Tipo de acceso", "PEATONAL", "VEHICULAR", "TODOS"),
++                        "placa", prop("string", "Placa del vehículo (opcional)")
++                ))));
++        lista.add(new DefinicionHerramienta("consultar_mascotas",
++                "Consulta mascotas registradas " + alcance + ".",
++                esquema(Map.of("torre", prop("string", "Torre (solo personal)")))));
++
++        if (usuario.getRol() != Usuario.Rol.CELADOR) {
++            lista.add(new DefinicionHerramienta("consultar_pagos",
++                    "Consulta pagos de administración " + alcance + ".",
++                    esquema(Map.of(
++                            "periodo", prop("string", "Periodo yyyy-MM"),
++                            "estado", propEnum("Estado", "PENDIENTE", "APROBADO", "RECHAZADO"),
++                            "limite", prop("integer", "Máximo de registros")
++                    ))));
++        }
++        if (staff) {
++            lista.add(new DefinicionHerramienta("resumen_conjunto",
++                    "Devuelve indicadores generales del conjunto: residentes, quejas por estado, paquetes pendientes, reservas próximas, accesos de hoy y recaudo del mes.",
++                    esquema(Map.of())));
++            lista.add(new DefinicionHerramienta("buscar_residente",
++                    "Busca residentes por nombre, torre o apartamento.",
++                    esquema(Map.of("texto", prop("string", "Nombre, torre o apartamento")), "texto")));
++        }
++        if (admin) {
++            lista.add(new DefinicionHerramienta("residentes_en_mora",
++                    "Lista residentes sin pago aprobado de administración en un periodo.",
++                    esquema(Map.of("periodo", prop("string", "Periodo yyyy-MM (por defecto el mes actual)")))));
++        }
++        return lista;
++    }
++
++    public String ejecutar(LlamadaHerramienta llamada, Usuario usuario) {
++        Map<String, Object> a = llamada.argumentos() != null ? llamada.argumentos() : Map.of();
++        boolean permitida = disponiblesPara(usuario).stream().anyMatch(h -> h.nombre().equals(llamada.nombre()));
++        if (!permitida) {
++            return aJson(Map.of("error", "Herramienta no permitida para el rol " + usuario.getRol()));
++        }
++        try {
++            Object resultado = switch (llamada.nombre()) {
++                case "buscar_conocimiento" -> buscarConocimiento(a);
++                case "registrar_conocimiento" -> registrarConocimiento(a, usuario);
++                case "consultar_quejas" -> consultarQuejas(a, usuario);
++                case "consultar_paqueteria" -> consultarPaqueteria(a, usuario);
++                case "consultar_reservas" -> consultarReservas(a, usuario);
++                case "consultar_accesos" -> consultarAccesos(a, usuario);
++                case "consultar_mascotas" -> consultarMascotas(a, usuario);
++                case "consultar_pagos" -> consultarPagos(a, usuario);
++                case "resumen_conjunto" -> metricasConjunto();
++                case "buscar_residente" -> buscarResidente(a);
++                case "residentes_en_mora" -> residentesEnMora(texto(a, "periodo"));
++                default -> Map.of("error", "Herramienta desconocida");
++            };
++            return aJson(resultado);
++        } catch (Exception e) {
++            log.warn("Error ejecutando herramienta {}: {}", llamada.nombre(), e.getMessage());
++            return aJson(Map.of("error", "No se pudo consultar: " + e.getMessage()));
++        }
++    }
++
++    public Map<String, Object> metricasConjunto() {
++        LocalDate hoy = LocalDate.now(ZONA);
++        String periodo = YearMonth.now(ZONA).toString();
++        List<Queja> quejas = quejaRepository.findAll();
++        List<PagoAdministracion> pagosMes = pagoRepository.findAll().stream()
++                .filter(p -> periodo.equals(p.getPeriodo())).toList();
++
++        Map<String, Object> m = new LinkedHashMap<>();
++        m.put("fecha", hoy.toString());
++        m.put("periodoActual", periodo);
++        m.put("residentes", usuarioRepository.findByRolOrderByNombreAsc(Usuario.Rol.RESIDENTE).size());
++        m.put("quejasPorEstado", contar(quejas.stream().map(q -> Objects.toString(q.getEstado(), "SIN_ESTADO"))));
++        m.put("quejasAbiertasPorCategoria", contar(quejas.stream()
++                .filter(q -> q.getEstado() != Queja.Estado.RESUELTO)
++                .map(q -> Objects.toString(q.getTipoQueja(), "GENERAL"))));
++        m.put("quejasAbiertasPrioridadAlta", quejas.stream()
++                .filter(q -> q.getEstado() != Queja.Estado.RESUELTO && "ALTA".equalsIgnoreCase(q.getPrioridadIA())).count());
++        m.put("paquetesPendientes", paqueteriaRepository.findAll().stream()
++                .filter(p -> p.getEstado() == Paqueteria.Estado.PENDIENTE).count());
++        m.put("reservasProximos7Dias", contar(reservaRepository.findAll().stream()
++                .filter(r -> r.getFechaReserva() != null && !r.getFechaReserva().isBefore(hoy)
++                        && !r.getFechaReserva().isAfter(hoy.plusDays(7)))
++                .map(r -> Objects.toString(r.getZonaComun(), "otra"))));
++        m.put("accesosVehicularesHoy", accesoVehicularRepository.findAll().stream().filter(x -> hoy.equals(x.getFecha())).count());
++        m.put("accesosPeatonalesHoy", accesoPeatonalRepository.findAll().stream().filter(x -> hoy.equals(x.getFecha())).count());
++        m.put("pagosAprobadosMes", pagosMes.stream().filter(p -> p.getEstadoPago() == PagoAdministracion.EstadoPago.APROBADO).count());
++        m.put("recaudoMes", pagosMes.stream()
++                .filter(p -> p.getEstadoPago() == PagoAdministracion.EstadoPago.APROBADO && p.getMonto() != null)
++                .map(PagoAdministracion::getMonto).reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add));
++        m.put("residentesEnMoraMes", ((List<?>) residentesEnMora(periodo).get("residentes")).size());
++        return m;
++    }
++
++    public Map<String, Object> residentesEnMora(String periodo) {
++        String p = (periodo == null || periodo.isBlank()) ? YearMonth.now(ZONA).toString() : YearMonth.parse(periodo.trim()).toString();
++        Set<Long> alDia = pagoRepository.findAll().stream()
++                .filter(x -> p.equals(x.getPeriodo()) && x.getEstadoPago() == PagoAdministracion.EstadoPago.APROBADO && x.getUsuario() != null)
++                .map(x -> x.getUsuario().getId()).collect(Collectors.toSet());
++        List<Map<String, Object>> mora = usuarioRepository.findByRolOrderByNombreAsc(Usuario.Rol.RESIDENTE).stream()
++                .filter(u -> !alDia.contains(u.getId()))
++                .map(this::residenteResumen).toList();
++        return Map.of("periodo", p, "total", mora.size(), "residentes", mora);
++    }
++
++    private Object buscarConocimiento(Map<String, Object> a) {
++        List<ConocimientoIA> encontrados = conocimientoService.buscarRelevantes(texto(a, "texto"), 5);
++        if (encontrados.isEmpty()) {
++            return Map.of("resultados", List.of(), "nota", "No hay información registrada sobre ese tema");
++        }
++        conocimientoService.registrarUso(encontrados);
++        return Map.of("resultados", encontrados.stream()
++                .map(c -> Map.of("titulo", c.getTitulo(), "contenido", c.getContenido())).toList());
++    }
++
++    private Object registrarConocimiento(Map<String, Object> a, Usuario usuario) {
++        ConocimientoIA c = conocimientoService.registrar(texto(a, "titulo"), texto(a, "contenido"),
++                texto(a, "categoria"), usuario, ConocimientoIA.Origen.CONVERSACION);
++        String nota = c.getEstado() == ConocimientoIA.Estado.APROBADO
++                ? "Guardado y disponible de inmediato"
++                : "Guardado como pendiente; quedará disponible cuando la administración lo apruebe";
++        return Map.of("estado", c.getEstado().name(), "nota", nota);
++    }
++
++    private Object consultarQuejas(Map<String, Object> a, Usuario u) {
++        String estado = texto(a, "estado");
++        String categoria = texto(a, "categoria");
++        Stream<Queja> s = quejaRepository.findAll().stream();
++        if (!esStaff(u)) {
++            s = s.filter(q -> q.getUsuario() != null && u.getId().equals(q.getUsuario().getId()));
++        }
++        List<Map<String, Object>> lista = s
++                .filter(q -> estado == null || (q.getEstado() != null && q.getEstado().name().equalsIgnoreCase(estado)))
++                .filter(q -> categoria == null || (q.getTipoQueja() != null && q.getTipoQueja().equalsIgnoreCase(categoria))
++                        || (q.getCategoriaIA() != null && q.getCategoriaIA().equalsIgnoreCase(categoria)))
++                .sorted(Comparator.comparing(Queja::getFechaCreacion, Comparator.nullsLast(Comparator.reverseOrder())))
++                .limit(limite(a))
++                .map(q -> {
++                    Map<String, Object> m = new LinkedHashMap<>();
++                    m.put("id", q.getId());
++                    m.put("tipo", q.getTipoQueja());
++                    m.put("descripcion", TextoIA.recortar(q.getDescripcion(), 300));
++                    m.put("estado", q.getEstado());
++                    m.put("fecha", q.getFechaCreacion());
++                    m.put("torreReportada", q.getTorre());
++                    m.put("apartamentoReportado", q.getApartamento());
++                    m.put("prioridadIA", q.getPrioridadIA());
++                    if (esStaff(u) && q.getUsuario() != null) {
++                        m.put("reportadoPor", q.getUsuario().getNombre());
++                    }
++                    return m;
++                }).toList();
++        return Map.of("total", lista.size(), "quejas", lista);
++    }
++
++    private Object consultarPaqueteria(Map<String, Object> a, Usuario u) {
++        String estado = texto(a, "estado");
++        String torre = texto(a, "torre");
++        List<Paqueteria> base = esStaff(u) ? paqueteriaRepository.findAll() : paqueteriaRepository.findByUsuarioId(u.getId());
++        List<Map<String, Object>> lista = base.stream()
++                .filter(p -> estado == null || (p.getEstado() != null && p.getEstado().name().equalsIgnoreCase(estado)))
++                .filter(p -> torre == null || !esStaff(u) || (p.getUsuario() != null && torre.equalsIgnoreCase(p.getUsuario().getTorre())))
++                .sorted(Comparator.comparing(Paqueteria::getFechaRecepcion, Comparator.nullsLast(Comparator.reverseOrder())))
++                .limit(limite(a))
++                .map(p -> {
++                    Map<String, Object> m = new LinkedHashMap<>();
++                    m.put("transportadora", p.getTransportadora());
++                    m.put("fechaRecepcion", p.getFechaRecepcion());
++                    m.put("estado", p.getEstado());
++                    if (esStaff(u) && p.getUsuario() != null) {
++                        m.put("destinatario", residenteResumen(p.getUsuario()));
++                    }
++                    return m;
++                }).toList();
++        return Map.of("total", lista.size(), "paquetes", lista);
++    }
++
++    private Object consultarReservas(Map<String, Object> a, Usuario u) {
++        LocalDate desde = fecha(texto(a, "desde"), LocalDate.now(ZONA));
++        LocalDate hasta = fecha(texto(a, "hasta"), desde.plusDays(7));
++        String zona = texto(a, "zona");
++        List<Map<String, Object>> lista = reservaRepository.findAll().stream()
++                .filter(r -> r.getFechaReserva() != null && !r.getFechaReserva().isBefore(desde) && !r.getFechaReserva().isAfter(hasta))
++                .filter(r -> zona == null || TextoIA.normalizar(zona).equals(TextoIA.normalizar(r.getZonaComun())))
++                .sorted(Comparator.comparing(ReservaZonaComun::getFechaReserva)
++                        .thenComparing(ReservaZonaComun::getHoraInicio, Comparator.nullsLast(Comparator.naturalOrder())))
++                .limit(LIMITE_MAXIMO)
++                .map(r -> {
++                    Map<String, Object> m = new LinkedHashMap<>();
++                    m.put("zona", r.getZonaComun());
++                    m.put("fecha", r.getFechaReserva());
++                    m.put("horaInicio", r.getHoraInicio());
++                    m.put("horaFin", r.getHoraFin());
++                    boolean propia = r.getUsuario() != null && u.getId().equals(r.getUsuario().getId());
++                    if (esStaff(u) && r.getUsuario() != null) {
++                        m.put("reservadoPor", residenteResumen(r.getUsuario()));
++                    } else {
++                        m.put("esMiReserva", propia);
++                    }
++                    return m;
++                }).toList();
++        return Map.of("desde", desde, "hasta", hasta, "total", lista.size(), "reservas", lista);
++    }
++
++    private Object consultarAccesos(Map<String, Object> a, Usuario u) {
++        LocalDate dia = fecha(texto(a, "fecha"), LocalDate.now(ZONA));
++        String tipo = Optional.ofNullable(texto(a, "tipo")).orElse("TODOS").toUpperCase();
++        String placa = texto(a, "placa");
++        List<Map<String, Object>> lista = new ArrayList<>();
++
++        if (!tipo.equals("PEATONAL")) {
++            accesoVehicularRepository.findAll().stream()
++                    .filter(x -> placa != null ? placa.equalsIgnoreCase(x.getPlacaVehiculo()) : dia.equals(x.getFecha()))
++                    .filter(x -> esStaff(u) || mismoApartamento(u, x.getTorre(), x.getApartamento()))
++                    .limit(LIMITE_MAXIMO)
++                    .forEach(x -> {
++                        Map<String, Object> m = new LinkedHashMap<>();
++                        m.put("tipo", "VEHICULAR");
++                        m.put("placa", x.getPlacaVehiculo());
++                        m.put("vehiculo", x.getTipoVehiculo());
++                        m.put("persona", x.getQuienIngresa());
++                        m.put("destino", x.getTorre() + "-" + x.getApartamento());
++                        m.put("fecha", x.getFecha());
++                        m.put("horaEntrada", x.getHoraEntrada());
++                        m.put("horaSalida", x.getHoraSalida());
++                        lista.add(m);
++                    });
++        }
++        if (!tipo.equals("VEHICULAR") && placa == null) {
++            accesoPeatonalRepository.findAll().stream()
++                    .filter(x -> dia.equals(x.getFecha()))
++                    .filter(x -> esStaff(u) || mismoApartamento(u, x.getTorre(), x.getApartamento()))
++                    .limit(LIMITE_MAXIMO)
++                    .forEach(x -> {
++                        Map<String, Object> m = new LinkedHashMap<>();
++                        m.put("tipo", "PEATONAL");
++                        m.put("visitante", x.getNombreVisitante());
++                        m.put("destino", x.getTorre() + "-" + x.getApartamento());
++                        m.put("fecha", x.getFecha());
++                        m.put("horaEntrada", x.getHoraEntrada());
++                        m.put("horaSalida", x.getHoraSalida());
++                        lista.add(m);
++                    });
++        }
++        return Map.of("fecha", dia, "total", lista.size(), "accesos", lista);
++    }
++
++    private Object consultarMascotas(Map<String, Object> a, Usuario u) {
++        String torre = texto(a, "torre");
++        List<Mascota> base = esStaff(u) ? mascotaRepository.findAll() : mascotaRepository.findByUsuarioId(u.getId());
++        List<Map<String, Object>> lista = base.stream()
++                .filter(m -> torre == null || !esStaff(u) || (m.getUsuario() != null && torre.equalsIgnoreCase(m.getUsuario().getTorre())))
++                .limit(LIMITE_MAXIMO)
++                .map(m -> {
++                    Map<String, Object> r = new LinkedHashMap<>();
++                    r.put("nombre", m.getNombre());
++                    r.put("tipo", m.getTipo());
++                    r.put("raza", m.getRaza());
++                    if (esStaff(u) && m.getUsuario() != null) {
++                        r.put("propietario", residenteResumen(m.getUsuario()));
++                    }
++                    return r;
++                }).toList();
++        return Map.of("total", lista.size(), "mascotas", lista);
++    }
++
++    private Object consultarPagos(Map<String, Object> a, Usuario u) {
++        String periodo = texto(a, "periodo");
++        String estado = texto(a, "estado");
++        List<PagoAdministracion> base = u.getRol() == Usuario.Rol.ADMINISTRADOR
++                ? pagoRepository.findAllByOrderByIdDesc()
++                : pagoRepository.findByUsuarioIdOrderByIdDesc(u.getId());
++        List<Map<String, Object>> lista = base.stream()
++                .filter(p -> periodo == null || periodo.equals(p.getPeriodo()))
++                .filter(p -> estado == null || (p.getEstadoPago() != null && p.getEstadoPago().name().equalsIgnoreCase(estado)))
++                .limit(limite(a))
++                .map(p -> {
++                    Map<String, Object> m = new LinkedHashMap<>();
++                    m.put("periodo", p.getPeriodo());
++                    m.put("monto", p.getMonto());
++                    m.put("estado", p.getEstadoPago());
++                    m.put("metodo", p.getMetodoPago());
++                    m.put("fechaPago", p.getFechaPago());
++                    m.put("concepto", p.getConcepto());
++                    if (u.getRol() == Usuario.Rol.ADMINISTRADOR && p.getUsuario() != null) {
++                        m.put("residente", residenteResumen(p.getUsuario()));
++                    }
++                    return m;
++                }).toList();
++        return Map.of("total", lista.size(), "pagos", lista);
++    }
++
++    private Object buscarResidente(Map<String, Object> a) {
++        String filtro = TextoIA.normalizar(texto(a, "texto"));
++        if (filtro.isBlank()) {
++            return Map.of("residentes", List.of());
++        }
++        List<Map<String, Object>> lista = usuarioRepository.findByRolOrderByNombreAsc(Usuario.Rol.RESIDENTE).stream()
++                .filter(u -> TextoIA.normalizar(u.getNombre() + " torre " + u.getTorre() + " apto " + u.getApartamento()
++                        + " " + u.getTorre() + "-" + u.getApartamento()).contains(filtro))
++                .limit(20)
++                .map(u -> {
++                    Map<String, Object> m = residenteResumen(u);
++                    m.put("telefono", u.getTelefono());
++                    return m;
++                }).toList();
++        return Map.of("total", lista.size(), "residentes", lista);
++    }
++
++    private Map<String, Object> residenteResumen(Usuario u) {
++        Map<String, Object> m = new LinkedHashMap<>();
++        m.put("nombre", u.getNombre());
++        m.put("torre", u.getTorre());
++        m.put("apartamento", u.getApartamento());
++        return m;
++    }
++
++    private boolean esStaff(Usuario u) {
++        return u.getRol() == Usuario.Rol.ADMINISTRADOR || u.getRol() == Usuario.Rol.CELADOR;
++    }
++
++    private boolean mismoApartamento(Usuario u, String torre, String apto) {
++        return u.getTorre() != null && u.getApartamento() != null
++                && u.getTorre().equalsIgnoreCase(Objects.toString(torre, "").trim())
++                && u.getApartamento().equalsIgnoreCase(Objects.toString(apto, "").trim());
++    }
++
++    private Map<String, Long> contar(Stream<String> valores) {
++        return valores.collect(Collectors.groupingBy(v -> v, LinkedHashMap::new, Collectors.counting()));
++    }
++
++    private String texto(Map<String, Object> a, String clave) {
++        Object v = a.get(clave);
++        return v == null || v.toString().isBlank() ? null : v.toString().trim();
++    }
++
++    private int limite(Map<String, Object> a) {
++        Object v = a.get("limite");
++        try {
++            int n = v == null ? LIMITE_DEFECTO : (int) Double.parseDouble(v.toString());
++            return Math.max(1, Math.min(n, LIMITE_MAXIMO));
++        } catch (NumberFormatException e) {
++            return LIMITE_DEFECTO;
++        }
++    }
++
++    private LocalDate fecha(String valor, LocalDate defecto) {
++        if (valor == null) {
++            return defecto;
++        }
++        try {
++            return LocalDate.parse(valor.length() > 10 ? valor.substring(0, 10) : valor);
++        } catch (Exception e) {
++            return defecto;
++        }
++    }
++
++    private String aJson(Object valor) {
++        try {
++            return json.writeValueAsString(valor);
++        } catch (Exception e) {
++            return "{\"error\":\"No se pudo serializar el resultado\"}";
++        }
++    }
++
++    private static Map<String, Object> esquema(Map<String, Object> propiedades, String... requeridos) {
++        Map<String, Object> s = new LinkedHashMap<>();
++        s.put("type", "object");
++        s.put("properties", propiedades);
++        if (requeridos.length > 0) {
++            s.put("required", List.of(requeridos));
++        }
++        return s;
++    }
++
++    private static Map<String, Object> prop(String tipo, String descripcion) {
++        return Map.of("type", tipo, "description", descripcion);
++    }
++
++    private static Map<String, Object> propEnum(String descripcion, String... valores) {
++        return Map.of("type", "string", "description", descripcion, "enum", List.of(valores));
++    }
++}
+diff --git a/src/main/java/com/example/APP/IA/IaConfig.java b/src/main/java/com/example/APP/IA/IaConfig.java
+new file mode 100644
+index 0000000..1a37b34
+--- /dev/null
++++ b/src/main/java/com/example/APP/IA/IaConfig.java
+@@ -0,0 +1,36 @@
++package com.example.APP.IA;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.http.client.SimpleClientHttpRequestFactory;
++import org.springframework.scheduling.annotation.EnableAsync;
++import org.springframework.web.client.RestTemplate;
++
++@Configuration
++@EnableAsync
++public class IaConfig {
++
++    @Bean
++    public LlmClient llmClient(
++            @Value("${ia.proveedor:anthropic}") String proveedor,
++            @Value("${ia.api-key:}") String apiKey,
++            @Value("${ia.modelo:}") String modelo,
++            @Value("${ia.base-url:}") String baseUrl,
++            @Value("${ia.max-tokens:1024}") int maxTokens,
++            ObjectMapper objectMapper
++    ) {
++        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
++        factory.setConnectTimeout(15_000);
++        factory.setReadTimeout(75_000);
++        RestTemplate restTemplate = new RestTemplate(factory);
++
++        if ("anthropic".equalsIgnoreCase(proveedor.trim())) {
++            String modeloFinal = modelo.isBlank() ? "claude-haiku-5-5" : modelo;
++            return new AnthropicLlmClient(restTemplate, apiKey, modeloFinal, baseUrl, maxTokens);
++        }
++        String modeloFinal = modelo.isBlank() ? "gpt-4o-mini" : modelo;
++        return new OpenAiCompatibleLlmClient(restTemplate, objectMapper, apiKey, modeloFinal, baseUrl, maxTokens);
++    }
++}
+diff --git a/src/main/java/com/example/APP/IA/LlmClient.java b/src/main/java/com/example/APP/IA/LlmClient.java
+new file mode 100644
+index 0000000..ca444d0
+--- /dev/null
++++ b/src/main/java/com/example/APP/IA/LlmClient.java
+@@ -0,0 +1,35 @@
++package com.example.APP.IA;
++
++import java.util.List;
++import java.util.Map;
++import java.util.function.Function;
++
++public interface LlmClient {
++
++    boolean disponible();
++
++    String proveedor();
++
++    String modelo();
++
++    ResultadoLlm conversar(String sistema,
++                           List<MensajeLlm> historial,
++                           List<DefinicionHerramienta> herramientas,
++                           Function<LlamadaHerramienta, String> ejecutor);
++
++    default String completar(String sistema, String prompt) {
++        return conversar(sistema, List.of(new MensajeLlm("user", prompt)), List.of(), llamada -> "").texto();
++    }
++
++    record MensajeLlm(String rol, String contenido) {
++    }
++
++    record DefinicionHerramienta(String nombre, String descripcion, Map<String, Object> parametros) {
++    }
++
++    record LlamadaHerramienta(String nombre, Map<String, Object> argumentos) {
++    }
++
++    record ResultadoLlm(String texto, List<String> herramientasUsadas) {
++    }
++}
+diff --git a/src/main/java/com/example/APP/IA/OpenAiCompatibleLlmClient.java b/src/main/java/com/example/APP/IA/OpenAiCompatibleLlmClient.java
+new file mode 100644
+index 0000000..a313cdd
+--- /dev/null
++++ b/src/main/java/com/example/APP/IA/OpenAiCompatibleLlmClient.java
+@@ -0,0 +1,134 @@
++package com.example.APP.IA;
++
++import com.fasterxml.jackson.core.type.TypeReference;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import org.springframework.http.HttpEntity;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.web.client.RestTemplate;
++
++import java.util.*;
++import java.util.function.Function;
++
++public class OpenAiCompatibleLlmClient implements LlmClient {
++
++    private static final int MAX_ITERACIONES = 6;
++
++    private final RestTemplate restTemplate;
++    private final ObjectMapper objectMapper;
++    private final String apiKey;
++    private final String modelo;
++    private final String baseUrl;
++    private final int maxTokens;
++
++    public OpenAiCompatibleLlmClient(RestTemplate restTemplate, ObjectMapper objectMapper, String apiKey,
++                                     String modelo, String baseUrl, int maxTokens) {
++        this.restTemplate = restTemplate;
++        this.objectMapper = objectMapper;
++        this.apiKey = apiKey;
++        this.modelo = modelo;
++        this.baseUrl = (baseUrl == null || baseUrl.isBlank()) ? "https://api.openai.com/v1" : baseUrl.replaceAll("/+$", "");
++        this.maxTokens = maxTokens;
++    }
++
++    @Override
++    public boolean disponible() {
++        return (apiKey != null && !apiKey.isBlank()) || baseUrl.contains("localhost") || baseUrl.contains("127.0.0.1");
++    }
++
++    @Override
++    public String proveedor() {
++        return "openai-compatible";
++    }
++
++    @Override
++    public String modelo() {
++        return modelo;
++    }
++
++    @Override
++    @SuppressWarnings("unchecked")
++    public ResultadoLlm conversar(String sistema, List<MensajeLlm> historial, List<DefinicionHerramienta> herramientas,
++                                  Function<LlamadaHerramienta, String> ejecutor) {
++        List<Map<String, Object>> mensajes = new ArrayList<>();
++        mensajes.add(Map.of("role", "system", "content", sistema));
++        for (MensajeLlm m : historial) {
++            mensajes.add(Map.of("role", m.rol(), "content", m.contenido()));
++        }
++
++        List<Map<String, Object>> tools = new ArrayList<>();
++        for (DefinicionHerramienta h : herramientas) {
++            tools.add(Map.of("type", "function", "function",
++                    Map.of("name", h.nombre(), "description", h.descripcion(), "parameters", h.parametros())));
++        }
++
++        List<String> usadas = new ArrayList<>();
++        for (int i = 0; i < MAX_ITERACIONES; i++) {
++            Map<String, Object> cuerpo = new LinkedHashMap<>();
++            cuerpo.put("model", modelo);
++            cuerpo.put("max_tokens", maxTokens);
++            cuerpo.put("messages", mensajes);
++            if (!tools.isEmpty()) {
++                cuerpo.put("tools", tools);
++            }
++
++            Map<String, Object> respuesta = restTemplate.postForObject(baseUrl + "/chat/completions",
++                    new HttpEntity<>(cuerpo, headers()), Map.class);
++            List<Map<String, Object>> choices = respuesta != null
++                    ? (List<Map<String, Object>>) respuesta.getOrDefault("choices", List.of()) : List.of();
++            if (choices.isEmpty()) {
++                throw new IllegalStateException("Respuesta vacía del proveedor de IA");
++            }
++
++            Map<String, Object> mensaje = (Map<String, Object>) choices.get(0).get("message");
++            List<Map<String, Object>> llamadas = mensaje.get("tool_calls") instanceof List<?> l
++                    ? (List<Map<String, Object>>) l : List.of();
++
++            if (llamadas.isEmpty()) {
++                Object contenido = mensaje.get("content");
++                return new ResultadoLlm(contenido != null ? contenido.toString().trim() : "", usadas);
++            }
++
++            Map<String, Object> asistente = new LinkedHashMap<>();
++            asistente.put("role", "assistant");
++            asistente.put("content", mensaje.get("content"));
++            asistente.put("tool_calls", llamadas);
++            mensajes.add(asistente);
++
++            for (Map<String, Object> llamada : llamadas) {
++                Map<String, Object> funcion = (Map<String, Object>) llamada.get("function");
++                String nombre = String.valueOf(funcion.get("name"));
++                usadas.add(nombre);
++                String salida = ejecutor.apply(new LlamadaHerramienta(nombre, leerArgumentos(funcion.get("arguments"))));
++                mensajes.add(Map.of("role", "tool", "tool_call_id", String.valueOf(llamada.get("id")), "content", salida));
++            }
++        }
++        return new ResultadoLlm("No pude completar la consulta en este momento. Intenta formularla de otra manera.", usadas);
++    }
++
++    private Map<String, Object> leerArgumentos(Object argumentos) {
++        if (argumentos instanceof Map<?, ?> m) {
++            Map<String, Object> copia = new HashMap<>();
++            m.forEach((k, v) -> copia.put(String.valueOf(k), v));
++            return copia;
++        }
++        if (argumentos == null || argumentos.toString().isBlank()) {
++            return Map.of();
++        }
++        try {
++            return objectMapper.readValue(argumentos.toString(), new TypeReference<Map<String, Object>>() {
++            });
++        } catch (Exception e) {
++            return Map.of();
++        }
++    }
++
++    private HttpHeaders headers() {
++        HttpHeaders headers = new HttpHeaders();
++        headers.setContentType(MediaType.APPLICATION_JSON);
++        if (apiKey != null && !apiKey.isBlank()) {
++            headers.setBearerAuth(apiKey);
++        }
++        return headers;
++    }
++}
+diff --git a/src/main/java/com/example/APP/IA/TextoIA.java b/src/main/java/com/example/APP/IA/TextoIA.java
+new file mode 100644
+index 0000000..8e6919f
+--- /dev/null
++++ b/src/main/java/com/example/APP/IA/TextoIA.java
+@@ -0,0 +1,49 @@
++package com.example.APP.IA;
++
++import java.text.Normalizer;
++import java.util.LinkedHashSet;
++import java.util.Set;
++
++public final class TextoIA {
++
++    private static final Set<String> STOPWORDS = Set.of(
++            "que", "como", "cual", "cuales", "cuando", "donde", "para", "por", "con", "sin", "los", "las",
++            "del", "una", "uno", "unos", "unas", "este", "esta", "estos", "estas", "ese", "esa", "hay",
++            "mis", "tus", "sus", "mas", "pero", "porque", "puedo", "puede", "tengo", "tiene", "quiero",
++            "sobre", "entre", "desde", "hasta", "muy", "ser", "son", "fue", "era", "estan", "the",
++            "hola", "favor", "gracias", "me", "mi", "se", "lo", "le", "al", "el", "la", "de", "en", "y", "o"
++    );
++
++    private TextoIA() {
++    }
++
++    public static String normalizar(String texto) {
++        if (texto == null) {
++            return "";
++        }
++        String sinAcentos = Normalizer.normalize(texto, Normalizer.Form.NFD).replaceAll("\\p{M}", "");
++        return sinAcentos.toLowerCase().replaceAll("[^a-z0-9ñ ]", " ").replaceAll("\\s+", " ").trim();
++    }
++
++    public static Set<String> tokens(String texto) {
++        Set<String> resultado = new LinkedHashSet<>();
++        for (String palabra : normalizar(texto).split(" ")) {
++            if (palabra.length() < 3 || STOPWORDS.contains(palabra)) {
++                continue;
++            }
++            resultado.add(raiz(palabra));
++        }
++        return resultado;
++    }
++
++    public static String raiz(String palabra) {
++        return palabra.length() > 6 ? palabra.substring(0, 6) : palabra;
++    }
++
++    public static String recortar(String texto, int max) {
++        if (texto == null) {
++            return "";
++        }
++        return texto.length() <= max ? texto : texto.substring(0, max) + "...";
++    }
++}
+diff --git a/src/main/java/com/example/APP/Model/ConocimientoIA.java b/src/main/java/com/example/APP/Model/ConocimientoIA.java
+new file mode 100644
+index 0000000..9ab282f
+--- /dev/null
++++ b/src/main/java/com/example/APP/Model/ConocimientoIA.java
+@@ -0,0 +1,60 @@
++package com.example.APP.Model;
++
++import com.fasterxml.jackson.annotation.JsonIgnore;
++import jakarta.persistence.*;
++import lombok.Getter;
++import lombok.Setter;
++
++import java.time.LocalDateTime;
++
++@Entity
++@Table(name = "conocimiento_ia")
++@Getter
++@Setter
++public class ConocimientoIA {
++
++    @Id
++    @GeneratedValue(strategy = GenerationType.IDENTITY)
++    private Long id;
++
++    @Column(length = 200)
++    private String titulo;
++
++    @Column(columnDefinition = "TEXT")
++    private String contenido;
++
++    @Column(length = 60)
++    private String categoria;
++
++    @Enumerated(EnumType.STRING)
++    @Column(length = 20)
++    private Estado estado;
++
++    @Enumerated(EnumType.STRING)
++    @Column(length = 20)
++    private Origen origen;
++
++    @JsonIgnore
++    @ManyToOne
++    @JoinColumn(name = "creado_por")
++    private Usuario creadoPor;
++
++    private LocalDateTime fechaCreacion;
++
++    private LocalDateTime fechaActualizacion;
++
++    private Integer usos = 0;
++
++    @Transient
++    public String getCreadoPorNombre() {
++        return creadoPor != null ? creadoPor.getNombre() : null;
++    }
++
++    public enum Estado {
++        PENDIENTE, APROBADO, RECHAZADO
++    }
++
++    public enum Origen {
++        SISTEMA, ADMINISTRADOR, CONVERSACION, FEEDBACK
++    }
++}
+diff --git a/src/main/java/com/example/APP/Model/ConversacionIA.java b/src/main/java/com/example/APP/Model/ConversacionIA.java
+new file mode 100644
+index 0000000..929247a
+--- /dev/null
++++ b/src/main/java/com/example/APP/Model/ConversacionIA.java
+@@ -0,0 +1,31 @@
++package com.example.APP.Model;
++
++import com.fasterxml.jackson.annotation.JsonIgnore;
++import jakarta.persistence.*;
++import lombok.Getter;
++import lombok.Setter;
++
++import java.time.LocalDateTime;
++
++@Entity
++@Table(name = "conversacion_ia")
++@Getter
++@Setter
++public class ConversacionIA {
++
++    @Id
++    @GeneratedValue(strategy = GenerationType.IDENTITY)
++    private Long id;
++
++    @Column(length = 200)
++    private String titulo;
++
++    @JsonIgnore
++    @ManyToOne
++    @JoinColumn(name = "usuario_id")
++    private Usuario usuario;
++
++    private LocalDateTime fechaCreacion;
++
++    private LocalDateTime fechaActualizacion;
++}
+diff --git a/src/main/java/com/example/APP/Model/MensajeIA.java b/src/main/java/com/example/APP/Model/MensajeIA.java
+new file mode 100644
+index 0000000..a07d1b9
+--- /dev/null
++++ b/src/main/java/com/example/APP/Model/MensajeIA.java
+@@ -0,0 +1,42 @@
++package com.example.APP.Model;
++
++import com.fasterxml.jackson.annotation.JsonIgnore;
++import jakarta.persistence.*;
++import lombok.Getter;
++import lombok.Setter;
++
++import java.time.LocalDateTime;
++
++@Entity
++@Table(name = "mensaje_ia")
++@Getter
++@Setter
++public class MensajeIA {
++
++    @Id
++    @GeneratedValue(strategy = GenerationType.IDENTITY)
++    private Long id;
++
++    @JsonIgnore
++    @ManyToOne
++    @JoinColumn(name = "conversacion_id")
++    private ConversacionIA conversacion;
++
++    @Enumerated(EnumType.STRING)
++    @Column(length = 20)
++    private Rol rol;
++
++    @Column(columnDefinition = "TEXT")
++    private String contenido;
++
++    @Column(length = 500)
++    private String herramientasUsadas;
++
++    private Boolean util;
++
++    private LocalDateTime fecha;
++
++    public enum Rol {
++        USUARIO, ASISTENTE
++    }
++}
+diff --git a/src/main/java/com/example/APP/Model/Queja.java b/src/main/java/com/example/APP/Model/Queja.java
+index b5ec829..f87e029 100644
+--- a/src/main/java/com/example/APP/Model/Queja.java
++++ b/src/main/java/com/example/APP/Model/Queja.java
+@@ -27,6 +27,20 @@ public class Queja{
+     @JoinColumn(name = "usuario_id")
+     private Usuario usuario;
+ 
++    @Column(length = 20)
++    private String prioridadIA;
++
++    @Column(length = 40)
++    private String categoriaIA;
++
++    @Column(columnDefinition = "TEXT")
++    private String resumenIA;
++
++    @Column(columnDefinition = "TEXT")
++    private String respuestaSugeridaIA;
++
++    private LocalDateTime fechaAnalisisIA;
++
+     public enum Estado {
+         PENDIENTE, EN_PROCESO, RESUELTO
+     }
+diff --git a/src/main/java/com/example/APP/Repository/ConocimientoIARepository.java b/src/main/java/com/example/APP/Repository/ConocimientoIARepository.java
+new file mode 100644
+index 0000000..89ad05e
+--- /dev/null
++++ b/src/main/java/com/example/APP/Repository/ConocimientoIARepository.java
+@@ -0,0 +1,13 @@
++package com.example.APP.Repository;
++
++import com.example.APP.Model.ConocimientoIA;
++import org.springframework.data.jpa.repository.JpaRepository;
++
++import java.util.List;
++
++public interface ConocimientoIARepository extends JpaRepository<ConocimientoIA, Long> {
++    List<ConocimientoIA> findByEstado(ConocimientoIA.Estado estado);
++    List<ConocimientoIA> findByEstadoOrderByFechaCreacionDesc(ConocimientoIA.Estado estado);
++    List<ConocimientoIA> findAllByOrderByFechaCreacionDesc();
++    boolean existsByTituloIgnoreCase(String titulo);
++}
+diff --git a/src/main/java/com/example/APP/Repository/ConversacionIARepository.java b/src/main/java/com/example/APP/Repository/ConversacionIARepository.java
+new file mode 100644
+index 0000000..fadc53e
+--- /dev/null
++++ b/src/main/java/com/example/APP/Repository/ConversacionIARepository.java
+@@ -0,0 +1,12 @@
++package com.example.APP.Repository;
++
++import com.example.APP.Model.ConversacionIA;
++import org.springframework.data.jpa.repository.JpaRepository;
++
++import java.util.List;
++import java.util.Optional;
++
++public interface ConversacionIARepository extends JpaRepository<ConversacionIA, Long> {
++    List<ConversacionIA> findByUsuarioIdOrderByFechaActualizacionDesc(Long usuarioId);
++    Optional<ConversacionIA> findByIdAndUsuarioId(Long id, Long usuarioId);
++}
+diff --git a/src/main/java/com/example/APP/Repository/MensajeIARepository.java b/src/main/java/com/example/APP/Repository/MensajeIARepository.java
+new file mode 100644
+index 0000000..f1d265a
+--- /dev/null
++++ b/src/main/java/com/example/APP/Repository/MensajeIARepository.java
+@@ -0,0 +1,22 @@
++package com.example.APP.Repository;
++
++import com.example.APP.Model.MensajeIA;
++import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Modifying;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.List;
++
++public interface MensajeIARepository extends JpaRepository<MensajeIA, Long> {
++    List<MensajeIA> findByConversacionIdOrderByIdAsc(Long conversacionId);
++    List<MensajeIA> findTop20ByConversacionIdOrderByIdDesc(Long conversacionId);
++    List<MensajeIA> findTop30ByRolAndUtilOrderByIdDesc(MensajeIA.Rol rol, Boolean util);
++    long countByUtil(Boolean util);
++
++    @Modifying
++    @Transactional
++    @Query("delete from MensajeIA m where m.conversacion.id = :conversacionId")
++    void eliminarPorConversacion(@Param("conversacionId") Long conversacionId);
++}
+diff --git a/src/main/java/com/example/APP/Service/ConocimientoIAService.java b/src/main/java/com/example/APP/Service/ConocimientoIAService.java
+new file mode 100644
+index 0000000..1dc3bfb
+--- /dev/null
++++ b/src/main/java/com/example/APP/Service/ConocimientoIAService.java
+@@ -0,0 +1,160 @@
++package com.example.APP.Service;
++
++import com.example.APP.IA.TextoIA;
++import com.example.APP.Model.ConocimientoIA;
++import com.example.APP.Model.Usuario;
++import com.example.APP.Repository.ConocimientoIARepository;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.context.event.ApplicationReadyEvent;
++import org.springframework.context.event.EventListener;
++import org.springframework.stereotype.Service;
++
++import java.time.LocalDateTime;
++import java.util.*;
++
++@Service
++public class ConocimientoIAService {
++
++    private static final Logger log = LoggerFactory.getLogger(ConocimientoIAService.class);
++
++    private final ConocimientoIARepository repository;
++
++    public ConocimientoIAService(ConocimientoIARepository repository) {
++        this.repository = repository;
++    }
++
++    public List<ConocimientoIA> buscarRelevantes(String consulta, int limite) {
++        Set<String> tokensConsulta = TextoIA.tokens(consulta);
++        if (tokensConsulta.isEmpty()) {
++            return List.of();
++        }
++        List<Map.Entry<ConocimientoIA, Integer>> puntuados = new ArrayList<>();
++        for (ConocimientoIA c : repository.findByEstado(ConocimientoIA.Estado.APROBADO)) {
++            Set<String> tokensTitulo = TextoIA.tokens(c.getTitulo() + " " + Objects.toString(c.getCategoria(), ""));
++            Set<String> tokensContenido = TextoIA.tokens(c.getContenido());
++            int puntaje = 0;
++            for (String t : tokensConsulta) {
++                if (tokensTitulo.contains(t)) {
++                    puntaje += 3;
++                } else if (tokensContenido.contains(t)) {
++                    puntaje += 1;
++                }
++            }
++            if (puntaje > 0) {
++                puntuados.add(Map.entry(c, puntaje));
++            }
++        }
++        puntuados.sort((a, b) -> b.getValue() - a.getValue());
++        return puntuados.stream().limit(limite).map(Map.Entry::getKey).toList();
++    }
++
++    public void registrarUso(List<ConocimientoIA> usados) {
++        for (ConocimientoIA c : usados) {
++            c.setUsos((c.getUsos() == null ? 0 : c.getUsos()) + 1);
++        }
++        repository.saveAll(usados);
++    }
++
++    public ConocimientoIA registrar(String titulo, String contenido, String categoria, Usuario autor,
++                                    ConocimientoIA.Origen origen) {
++        if (titulo == null || titulo.isBlank() || contenido == null || contenido.isBlank()) {
++            throw new IllegalArgumentException("Título y contenido son obligatorios");
++        }
++        boolean esAdmin = autor != null && autor.getRol() == Usuario.Rol.ADMINISTRADOR;
++        boolean aprobadoDirecto = origen == ConocimientoIA.Origen.SISTEMA
++                || (esAdmin && origen != ConocimientoIA.Origen.FEEDBACK);
++
++        ConocimientoIA c = new ConocimientoIA();
++        c.setTitulo(TextoIA.recortar(titulo.trim(), 195));
++        c.setContenido(contenido.trim());
++        c.setCategoria(categoria != null && !categoria.isBlank() ? categoria.trim().toUpperCase() : "GENERAL");
++        c.setOrigen(origen);
++        c.setEstado(aprobadoDirecto ? ConocimientoIA.Estado.APROBADO : ConocimientoIA.Estado.PENDIENTE);
++        c.setCreadoPor(autor);
++        c.setFechaCreacion(LocalDateTime.now());
++        c.setFechaActualizacion(LocalDateTime.now());
++        c.setUsos(0);
++        return repository.save(c);
++    }
++
++    public List<ConocimientoIA> listar(String estado) {
++        if (estado == null || estado.isBlank()) {
++            return repository.findAllByOrderByFechaCreacionDesc();
++        }
++        return repository.findByEstadoOrderByFechaCreacionDesc(ConocimientoIA.Estado.valueOf(estado.trim().toUpperCase()));
++    }
++
++    public ConocimientoIA cambiarEstado(Long id, ConocimientoIA.Estado estado) {
++        ConocimientoIA c = repository.findById(id)
++                .orElseThrow(() -> new IllegalArgumentException("Conocimiento no encontrado: " + id));
++        c.setEstado(estado);
++        c.setFechaActualizacion(LocalDateTime.now());
++        return repository.save(c);
++    }
++
++    public ConocimientoIA actualizar(Long id, Map<String, Object> datos) {
++        ConocimientoIA c = repository.findById(id)
++                .orElseThrow(() -> new IllegalArgumentException("Conocimiento no encontrado: " + id));
++        if (datos.get("titulo") != null) {
++            c.setTitulo(TextoIA.recortar(datos.get("titulo").toString().trim(), 195));
++        }
++        if (datos.get("contenido") != null) {
++            c.setContenido(datos.get("contenido").toString().trim());
++        }
++        if (datos.get("categoria") != null) {
++            c.setCategoria(datos.get("categoria").toString().trim().toUpperCase());
++        }
++        c.setFechaActualizacion(LocalDateTime.now());
++        return repository.save(c);
++    }
++
++    public void eliminar(Long id) {
++        repository.deleteById(id);
++    }
++
++    public Map<String, Long> conteoPorEstado() {
++        Map<String, Long> conteo = new LinkedHashMap<>();
++        for (ConocimientoIA.Estado e : ConocimientoIA.Estado.values()) {
++            conteo.put(e.name(), 0L);
++        }
++        for (ConocimientoIA c : repository.findAll()) {
++            if (c.getEstado() != null) {
++                conteo.merge(c.getEstado().name(), 1L, Long::sum);
++            }
++        }
++        return conteo;
++    }
++
++    @EventListener(ApplicationReadyEvent.class)
++    public void sembrarConocimientoBase() {
++        try {
++            if (repository.count() > 0) {
++                return;
++            }
++            sembrar("Reservas de piscina", "RESERVAS",
++                    "La piscina se reserva de miércoles a domingo en las franjas 8:00-12:00 o 16:00-20:00, con un máximo de 3 horas por reserva. No puede cruzarse con otra reserva existente.");
++            sembrar("Reservas de gimnasio", "RESERVAS",
++                    "El gimnasio se reserva de lunes a sábado en las franjas 5:00-10:00 o 15:00-20:00, con un máximo de 3 horas por reserva.");
++            sembrar("Reservas del salón comunal", "RESERVAS",
++                    "El salón comunal se reserva entre las 8:00 y las 22:00 con un rango mínimo de 5 horas. Servicios adicionales: sillas (25 por $32.000, 50 por $60.000, 100 por $125.000), mesas (6 puestos $8.000, 10 puestos $18.000) y aseo del salón ($150.000).");
++            sembrar("Reservas de zona BBQ", "RESERVAS",
++                    "La zona BBQ se reserva de jueves a domingo entre las 10:00 y las 22:00. Cada residente puede tener solo 1 reserva de BBQ por día. Admite sillas y mesas como servicios adicionales.");
++            sembrar("Pago de administración", "PAGOS",
++                    "La cuota de administración se paga por periodo mensual (formato año-mes). Se puede pagar en línea por PSE a través de Mercado Pago desde la sección Pagos de la app, o en efectivo en administración. Solo puede existir un pago aprobado por periodo.");
++            sembrar("Cómo registrar una queja", "QUEJAS",
++                    "Los residentes registran quejas desde la sección Quejas indicando tipo, descripción, torre y apartamento involucrados y fecha. La queja pasa por los estados PENDIENTE, EN_PROCESO y RESUELTO; al resolverse el residente recibe una notificación.");
++            sembrar("Paquetería", "PAQUETERIA",
++                    "La portería registra los paquetes recibidos con la transportadora y la fecha. El residente puede ver en la app sus paquetes en estado PENDIENTE o ENTREGADO.");
++            sembrar("Accesos de visitantes", "ACCESOS",
++                    "Los residentes autorizan visitantes peatonales o vehiculares desde la sección Accesos, lo que genera un código QR. El celador valida ese código al ingreso y registra la hora de entrada y salida.");
++            log.info("Conocimiento base de IA sembrado");
++        } catch (Exception e) {
++            log.warn("No se pudo sembrar el conocimiento base de IA: {}", e.getMessage());
++        }
++    }
++
++    private void sembrar(String titulo, String categoria, String contenido) {
++        registrar(titulo, contenido, categoria, null, ConocimientoIA.Origen.SISTEMA);
++    }
++}
+diff --git a/src/main/java/com/example/APP/Service/IaChatService.java b/src/main/java/com/example/APP/Service/IaChatService.java
+new file mode 100644
+index 0000000..44e3c90
+--- /dev/null
++++ b/src/main/java/com/example/APP/Service/IaChatService.java
+@@ -0,0 +1,318 @@
++package com.example.APP.Service;
++
++import com.example.APP.IA.HerramientasIA;
++import com.example.APP.IA.LlmClient;
++import com.example.APP.IA.LlmClient.MensajeLlm;
++import com.example.APP.IA.TextoIA;
++import com.example.APP.Model.ConocimientoIA;
++import com.example.APP.Model.ConversacionIA;
++import com.example.APP.Model.MensajeIA;
++import com.example.APP.Model.Usuario;
++import com.example.APP.Repository.ConversacionIARepository;
++import com.example.APP.Repository.MensajeIARepository;
++import com.example.APP.Repository.UsuarioRepository;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Service;
++
++import java.time.Instant;
++import java.time.LocalDateTime;
++import java.time.format.DateTimeFormatter;
++import java.util.*;
++import java.util.concurrent.ConcurrentHashMap;
++
++@Service
++public class IaChatService {
++
++    private static final Logger log = LoggerFactory.getLogger(IaChatService.class);
++    private static final int MAX_CARACTERES = 1500;
++    private static final Set<String> HERRAMIENTAS_PERSONALES = Set.of(
++            "consultar_quejas", "consultar_paqueteria", "consultar_reservas", "consultar_accesos",
++            "consultar_mascotas", "consultar_pagos", "resumen_conjunto", "buscar_residente", "residentes_en_mora");
++
++    private final LlmClient llm;
++    private final HerramientasIA herramientas;
++    private final ConocimientoIAService conocimientoService;
++    private final ConversacionIARepository conversacionRepository;
++    private final MensajeIARepository mensajeRepository;
++    private final UsuarioRepository usuarioRepository;
++    private final Map<Long, Deque<Instant>> usoPorUsuario = new ConcurrentHashMap<>();
++
++    @Value("${ia.nombre-asistente:Asistente del Conjunto}")
++    private String nombreAsistente;
++
++    @Value("${ia.nombre-conjunto:el conjunto residencial}")
++    private String nombreConjunto;
++
++    @Value("${ia.limite-mensajes-hora:40}")
++    private int limiteMensajesHora;
++
++    public IaChatService(LlmClient llm, HerramientasIA herramientas, ConocimientoIAService conocimientoService,
++                         ConversacionIARepository conversacionRepository, MensajeIARepository mensajeRepository,
++                         UsuarioRepository usuarioRepository) {
++        this.llm = llm;
++        this.herramientas = herramientas;
++        this.conocimientoService = conocimientoService;
++        this.conversacionRepository = conversacionRepository;
++        this.mensajeRepository = mensajeRepository;
++        this.usuarioRepository = usuarioRepository;
++    }
++
++    public Map<String, Object> chat(String username, Long conversacionId, String texto) {
++        Usuario usuario = usuario(username);
++        if (texto == null || texto.isBlank()) {
++            throw new IllegalArgumentException("El mensaje es obligatorio");
++        }
++        String mensaje = texto.trim();
++        if (mensaje.length() > MAX_CARACTERES) {
++            throw new IllegalArgumentException("El mensaje supera los " + MAX_CARACTERES + " caracteres");
++        }
++        validarLimite(usuario.getId());
++
++        ConversacionIA conversacion = conversacionId != null
++                ? conversacionRepository.findByIdAndUsuarioId(conversacionId, usuario.getId())
++                .orElseThrow(() -> new IllegalArgumentException("Conversación no encontrada"))
++                : nuevaConversacion(usuario, mensaje);
++
++        List<MensajeIA> previos = new ArrayList<>(mensajeRepository.findTop20ByConversacionIdOrderByIdDesc(conversacion.getId()));
++        Collections.reverse(previos);
++        guardarMensaje(conversacion, MensajeIA.Rol.USUARIO, mensaje, null);
++
++        List<ConocimientoIA> relevantes = conocimientoService.buscarRelevantes(mensaje, 4);
++        String respuesta;
++        List<String> usadas = new ArrayList<>();
++
++        if (!llm.disponible()) {
++            respuesta = respuestaSinIA(relevantes);
++        } else {
++            try {
++                List<MensajeLlm> historial = construirHistorial(previos, mensaje);
++                LlmClient.ResultadoLlm resultado = llm.conversar(promptSistema(usuario, relevantes), historial,
++                        herramientas.disponiblesPara(usuario), llamada -> herramientas.ejecutar(llamada, usuario));
++                respuesta = resultado.texto() == null || resultado.texto().isBlank()
++                        ? "No tengo una respuesta para eso en este momento." : resultado.texto();
++                usadas = resultado.herramientasUsadas();
++            } catch (Exception e) {
++                log.error("Error consultando el proveedor de IA: {}", e.getMessage());
++                respuesta = "El asistente inteligente no está disponible en este momento. " + respuestaSinIA(relevantes);
++            }
++        }
++        if (!relevantes.isEmpty()) {
++            conocimientoService.registrarUso(relevantes);
++        }
++
++        MensajeIA guardado = guardarMensaje(conversacion, MensajeIA.Rol.ASISTENTE, respuesta,
++                usadas.isEmpty() ? null : TextoIA.recortar(String.join(",", new LinkedHashSet<>(usadas)), 490));
++        conversacion.setFechaActualizacion(LocalDateTime.now());
++        conversacionRepository.save(conversacion);
++
++        Map<String, Object> r = new LinkedHashMap<>();
++        r.put("conversacionId", conversacion.getId());
++        r.put("mensajeId", guardado.getId());
++        r.put("respuesta", respuesta);
++        r.put("herramientasUsadas", new ArrayList<>(new LinkedHashSet<>(usadas)));
++        r.put("iaDisponible", llm.disponible());
++        return r;
++    }
++
++    public List<Map<String, Object>> conversaciones(String username) {
++        Usuario usuario = usuario(username);
++        return conversacionRepository.findByUsuarioIdOrderByFechaActualizacionDesc(usuario.getId()).stream()
++                .map(c -> {
++                    Map<String, Object> m = new LinkedHashMap<>();
++                    m.put("id", c.getId());
++                    m.put("titulo", c.getTitulo());
++                    m.put("fechaActualizacion", c.getFechaActualizacion());
++                    return m;
++                }).toList();
++    }
++
++    public List<MensajeIA> mensajes(String username, Long conversacionId) {
++        Usuario usuario = usuario(username);
++        conversacionRepository.findByIdAndUsuarioId(conversacionId, usuario.getId())
++                .orElseThrow(() -> new IllegalArgumentException("Conversación no encontrada"));
++        return mensajeRepository.findByConversacionIdOrderByIdAsc(conversacionId);
++    }
++
++    public void eliminarConversacion(String username, Long conversacionId) {
++        Usuario usuario = usuario(username);
++        ConversacionIA c = conversacionRepository.findByIdAndUsuarioId(conversacionId, usuario.getId())
++                .orElseThrow(() -> new IllegalArgumentException("Conversación no encontrada"));
++        mensajeRepository.eliminarPorConversacion(c.getId());
++        conversacionRepository.delete(c);
++    }
++
++    public Map<String, Object> feedback(String username, Long mensajeId, boolean util) {
++        Usuario usuario = usuario(username);
++        MensajeIA respuesta = mensajeRepository.findById(mensajeId)
++                .orElseThrow(() -> new IllegalArgumentException("Mensaje no encontrado"));
++        if (respuesta.getConversacion() == null || respuesta.getConversacion().getUsuario() == null
++                || !usuario.getId().equals(respuesta.getConversacion().getUsuario().getId())
++                || respuesta.getRol() != MensajeIA.Rol.ASISTENTE) {
++            throw new IllegalArgumentException("Mensaje no válido para calificar");
++        }
++        respuesta.setUtil(util);
++        mensajeRepository.save(respuesta);
++
++        boolean aprendido = false;
++        if (util && !usoDatosPersonales(respuesta)) {
++            Optional<MensajeIA> pregunta = preguntaAnterior(respuesta);
++            if (pregunta.isPresent()) {
++                String titulo = TextoIA.recortar(pregunta.get().getContenido(), 195);
++                if (!conocimientoService.listar(null).stream().anyMatch(c -> c.getTitulo().equalsIgnoreCase(titulo))) {
++                    conocimientoService.registrar(titulo, respuesta.getContenido(), "GENERAL", usuario,
++                            ConocimientoIA.Origen.FEEDBACK);
++                    aprendido = true;
++                }
++            }
++        }
++        return Map.of("util", util, "propuestoComoConocimiento", aprendido);
++    }
++
++    public List<Map<String, Object>> respuestasMalCalificadas() {
++        return mensajeRepository.findTop30ByRolAndUtilOrderByIdDesc(MensajeIA.Rol.ASISTENTE, false).stream()
++                .map(r -> {
++                    Map<String, Object> m = new LinkedHashMap<>();
++                    m.put("mensajeId", r.getId());
++                    m.put("pregunta", preguntaAnterior(r).map(MensajeIA::getContenido).orElse(""));
++                    m.put("respuesta", r.getContenido());
++                    m.put("fecha", r.getFecha());
++                    return m;
++                }).toList();
++    }
++
++    public Map<String, Object> estado() {
++        Map<String, Object> m = new LinkedHashMap<>();
++        m.put("disponible", llm.disponible());
++        m.put("proveedor", llm.proveedor());
++        m.put("modelo", llm.modelo());
++        m.put("nombreAsistente", nombreAsistente);
++        m.put("respuestasUtiles", mensajeRepository.countByUtil(true));
++        m.put("respuestasNoUtiles", mensajeRepository.countByUtil(false));
++        m.put("conocimiento", conocimientoService.conteoPorEstado());
++        return m;
++    }
++
++    private String promptSistema(Usuario u, List<ConocimientoIA> relevantes) {
++        String ahora = LocalDateTime.now(HerramientasIA.ZONA)
++                .format(DateTimeFormatter.ofPattern("EEEE d 'de' MMMM 'de' yyyy, HH:mm", Locale.of("es", "CO")));
++        StringBuilder sb = new StringBuilder();
++        sb.append("Eres ").append(nombreAsistente).append(", el asistente virtual de ").append(nombreConjunto)
++                .append(". Ayudas a residentes, celadores y administración con la gestión del conjunto.\n\n");
++        sb.append("Usuario actual: ").append(u.getNombre()).append(" | Rol: ").append(u.getRol());
++        if (u.getRol() == Usuario.Rol.RESIDENTE) {
++            sb.append(" | Torre ").append(u.getTorre()).append(", apartamento ").append(u.getApartamento());
++        }
++        sb.append("\nFecha y hora actual (Colombia): ").append(ahora).append("\n\n");
++        sb.append("""
++                Reglas:
++                - Responde siempre en español, de forma breve, clara y amable. Usa listas cortas solo si ayudan.
++                - Para cualquier dato del conjunto (quejas, pagos, paquetes, reservas, accesos, mascotas, residentes) usa las herramientas; nunca inventes cifras, nombres ni fechas.
++                - Para normas, horarios, tarifas o procedimientos consulta primero buscar_conocimiento. Si no hay información, dilo con honestidad y sugiere contactar a la administración.
++                - Las herramientas ya limitan la información según el rol. No intentes obtener datos de otros residentes para un residente.
++                - No realizas acciones como crear reservas, pagos o quejas: explica en qué sección de la app se hacen.
++                - Cuando el usuario te enseñe una norma, horario, tarifa o procedimiento GENERAL del conjunto, guárdalo con registrar_conocimiento. Nunca guardes datos personales.
++                - Si te piden algo fuera del ámbito del conjunto, responde brevemente y vuelve al tema de la convivencia y la gestión.
++                """);
++        if (u.getRol() == Usuario.Rol.ADMINISTRADOR) {
++            sb.append("- Con la administración puedes analizar indicadores, detectar problemas recurrentes, priorizar quejas y proponer acciones concretas.\n");
++        } else if (u.getRol() == Usuario.Rol.CELADOR) {
++            sb.append("- Con el celador prioriza información operativa: paquetes pendientes, accesos del día, reservas y quejas abiertas.\n");
++        }
++        if (!relevantes.isEmpty()) {
++            sb.append("\nConocimiento del conjunto relacionado con la pregunta:\n");
++            for (ConocimientoIA c : relevantes) {
++                sb.append("* ").append(c.getTitulo()).append(": ").append(TextoIA.recortar(c.getContenido(), 800)).append("\n");
++            }
++        }
++        return sb.toString();
++    }
++
++    private List<MensajeLlm> construirHistorial(List<MensajeIA> previos, String mensajeActual) {
++        List<MensajeLlm> lista = new ArrayList<>();
++        for (MensajeIA m : previos) {
++            if (m.getContenido() == null || m.getContenido().isBlank()) {
++                continue;
++            }
++            agregar(lista, m.getRol() == MensajeIA.Rol.USUARIO ? "user" : "assistant", m.getContenido());
++        }
++        agregar(lista, "user", mensajeActual);
++        while (!lista.isEmpty() && !"user".equals(lista.get(0).rol())) {
++            lista.remove(0);
++        }
++        return lista;
++    }
++
++    private void agregar(List<MensajeLlm> lista, String rol, String contenido) {
++        if (!lista.isEmpty() && lista.get(lista.size() - 1).rol().equals(rol)) {
++            MensajeLlm ultimo = lista.remove(lista.size() - 1);
++            lista.add(new MensajeLlm(rol, ultimo.contenido() + "\n\n" + contenido));
++        } else {
++            lista.add(new MensajeLlm(rol, contenido));
++        }
++    }
++
++    private String respuestaSinIA(List<ConocimientoIA> relevantes) {
++        if (relevantes.isEmpty()) {
++            return "No encontré información sobre eso. Puedes consultar con la administración del conjunto.";
++        }
++        ConocimientoIA mejor = relevantes.get(0);
++        return mejor.getTitulo() + ": " + mejor.getContenido();
++    }
++
++    private boolean usoDatosPersonales(MensajeIA respuesta) {
++        String usadas = respuesta.getHerramientasUsadas();
++        if (usadas == null || usadas.isBlank()) {
++            return false;
++        }
++        return Arrays.stream(usadas.split(",")).map(String::trim).anyMatch(HERRAMIENTAS_PERSONALES::contains);
++    }
++
++    private Optional<MensajeIA> preguntaAnterior(MensajeIA respuesta) {
++        if (respuesta.getConversacion() == null) {
++            return Optional.empty();
++        }
++        return mensajeRepository.findByConversacionIdOrderByIdAsc(respuesta.getConversacion().getId()).stream()
++                .filter(m -> m.getId() < respuesta.getId() && m.getRol() == MensajeIA.Rol.USUARIO)
++                .reduce((a, b) -> b);
++    }
++
++    private ConversacionIA nuevaConversacion(Usuario usuario, String mensaje) {
++        ConversacionIA c = new ConversacionIA();
++        c.setUsuario(usuario);
++        c.setTitulo(TextoIA.recortar(mensaje, 60));
++        c.setFechaCreacion(LocalDateTime.now());
++        c.setFechaActualizacion(LocalDateTime.now());
++        return conversacionRepository.save(c);
++    }
++
++    private MensajeIA guardarMensaje(ConversacionIA c, MensajeIA.Rol rol, String contenido, String herramientasUsadas) {
++        MensajeIA m = new MensajeIA();
++        m.setConversacion(c);
++        m.setRol(rol);
++        m.setContenido(contenido);
++        m.setHerramientasUsadas(herramientasUsadas);
++        m.setFecha(LocalDateTime.now());
++        return mensajeRepository.save(m);
++    }
++
++    private void validarLimite(Long usuarioId) {
++        Instant haceUnaHora = Instant.now().minusSeconds(3600);
++        Deque<Instant> usos = usoPorUsuario.computeIfAbsent(usuarioId, k -> new ArrayDeque<>());
++        synchronized (usos) {
++            while (!usos.isEmpty() && usos.peekFirst().isBefore(haceUnaHora)) {
++                usos.pollFirst();
++            }
++            if (usos.size() >= limiteMensajesHora) {
++                throw new IllegalArgumentException("Alcanzaste el límite de mensajes por hora. Intenta más tarde.");
++            }
++            usos.addLast(Instant.now());
++        }
++    }
++
++    private Usuario usuario(String username) {
++        return usuarioRepository.findByUsuario(username)
++                .orElseThrow(() -> new IllegalArgumentException("Usuario no encontrado"));
++    }
++}
+diff --git a/src/main/java/com/example/APP/Service/IaGestionService.java b/src/main/java/com/example/APP/Service/IaGestionService.java
+new file mode 100644
+index 0000000..2fa1dfc
+--- /dev/null
++++ b/src/main/java/com/example/APP/Service/IaGestionService.java
+@@ -0,0 +1,229 @@
++package com.example.APP.Service;
++
++import com.example.APP.IA.HerramientasIA;
++import com.example.APP.IA.LlmClient;
++import com.example.APP.IA.TextoIA;
++import com.example.APP.Model.Queja;
++import com.example.APP.Repository.QuejaRepository;
++import com.fasterxml.jackson.core.type.TypeReference;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.SerializationFeature;
++import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.scheduling.annotation.Async;
++import org.springframework.stereotype.Service;
++
++import java.time.LocalDateTime;
++import java.util.*;
++
++@Service
++public class IaGestionService {
++
++    private static final Logger log = LoggerFactory.getLogger(IaGestionService.class);
++    private static final List<String> CATEGORIAS = List.of(
++            "RUIDO", "MASCOTA", "VIOLENCIA", "ZONAS_COMUNES", "PARQUEADERO", "SEGURIDAD", "ASEO", "INFRAESTRUCTURA", "GENERAL");
++
++    private final LlmClient llm;
++    private final QuejaRepository quejaRepository;
++    private final HerramientasIA herramientas;
++    private final ObjectMapper json = new ObjectMapper().registerModule(new JavaTimeModule())
++            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
++
++    public IaGestionService(LlmClient llm, QuejaRepository quejaRepository, HerramientasIA herramientas) {
++        this.llm = llm;
++        this.quejaRepository = quejaRepository;
++        this.herramientas = herramientas;
++    }
++
++    @Async
++    public void analizarQuejaAsync(Long quejaId) {
++        try {
++            analizarQueja(quejaId);
++        } catch (Exception e) {
++            log.warn("No se pudo analizar la queja {}: {}", quejaId, e.getMessage());
++        }
++    }
++
++    public Queja analizarQueja(Long quejaId) {
++        Queja q = quejaRepository.findById(quejaId)
++                .orElseThrow(() -> new IllegalArgumentException("Queja no encontrada: " + quejaId));
++        Map<String, Object> analisis = null;
++
++        if (llm.disponible()) {
++            try {
++                String sistema = "Eres un analista de convivencia de un conjunto residencial en Colombia. "
++                        + "Respondes únicamente con un objeto JSON válido, sin texto adicional ni bloques de código.";
++                String prompt = "Analiza esta queja de un residente.\n"
++                        + "Tipo indicado: " + q.getTipoQueja() + "\n"
++                        + "Torre/apto reportado: " + q.getTorre() + "-" + q.getApartamento() + "\n"
++                        + "Descripción: " + TextoIA.recortar(q.getDescripcion(), 1500) + "\n\n"
++                        + "Devuelve JSON con las claves:\n"
++                        + "categoria: una de " + CATEGORIAS + "\n"
++                        + "prioridad: ALTA (riesgo para personas o bienes, violencia, emergencias), MEDIA (afecta la convivencia de forma reiterada) o BAJA\n"
++                        + "resumen: una frase de máximo 25 palabras\n"
++                        + "respuestaSugerida: respuesta cordial de la administración al residente, máximo 70 palabras";
++                analisis = leerJson(llm.completar(sistema, prompt));
++            } catch (Exception e) {
++                log.warn("Fallo análisis IA de queja {}, se usa heurística: {}", quejaId, e.getMessage());
++            }
++        }
++        if (analisis == null) {
++            analisis = analisisHeuristico(q);
++        }
++
++        String categoria = Objects.toString(analisis.get("categoria"), "GENERAL").toUpperCase().trim();
++        String prioridad = Objects.toString(analisis.get("prioridad"), "MEDIA").toUpperCase().trim();
++        q.setCategoriaIA(CATEGORIAS.contains(categoria) ? categoria : "GENERAL");
++        q.setPrioridadIA(Set.of("ALTA", "MEDIA", "BAJA").contains(prioridad) ? prioridad : "MEDIA");
++        q.setResumenIA(TextoIA.recortar(Objects.toString(analisis.get("resumen"), ""), 600));
++        q.setRespuestaSugeridaIA(TextoIA.recortar(Objects.toString(analisis.get("respuestaSugerida"), ""), 1500));
++        q.setFechaAnalisisIA(LocalDateTime.now());
++        return quejaRepository.save(q);
++    }
++
++    public Map<String, Object> resumenGestion() {
++        Map<String, Object> metricas = herramientas.metricasConjunto();
++        List<Map<String, Object>> quejasAbiertas = quejaRepository.findAll().stream()
++                .filter(q -> q.getEstado() != Queja.Estado.RESUELTO)
++                .sorted(Comparator.comparing(Queja::getFechaCreacion, Comparator.nullsLast(Comparator.reverseOrder())))
++                .limit(15)
++                .map(q -> {
++                    Map<String, Object> m = new LinkedHashMap<>();
++                    m.put("id", q.getId());
++                    m.put("tipo", q.getTipoQueja());
++                    m.put("prioridad", q.getPrioridadIA());
++                    m.put("estado", q.getEstado());
++                    m.put("descripcion", TextoIA.recortar(q.getDescripcion(), 200));
++                    m.put("fecha", q.getFechaCreacion());
++                    return m;
++                }).toList();
++
++        String analisis = null;
++        boolean generadoPorIA = false;
++        if (llm.disponible()) {
++            try {
++                String sistema = "Eres un asesor experto en administración de propiedad horizontal en Colombia. "
++                        + "Escribes en español, en tono profesional y directo.";
++                String prompt = "Indicadores actuales del conjunto (JSON):\n" + json.writeValueAsString(metricas)
++                        + "\n\nQuejas abiertas más recientes (JSON):\n" + json.writeValueAsString(quejasAbiertas)
++                        + "\n\nRedacta un informe breve para la administración con estas secciones: "
++                        + "1) Situación general (2-3 frases), 2) Alertas prioritarias, 3) Patrones detectados, "
++                        + "4) Acciones recomendadas para esta semana (máximo 5, concretas). "
++                        + "Usa solo los datos entregados; no inventes cifras. Máximo 250 palabras.";
++                analisis = llm.completar(sistema, prompt);
++                generadoPorIA = analisis != null && !analisis.isBlank();
++            } catch (Exception e) {
++                log.warn("Fallo resumen de gestión con IA: {}", e.getMessage());
++            }
++        }
++        if (!generadoPorIA) {
++            analisis = resumenHeuristico(metricas);
++        }
++
++        Map<String, Object> r = new LinkedHashMap<>();
++        r.put("metricas", metricas);
++        r.put("quejasAbiertas", quejasAbiertas);
++        r.put("analisis", analisis);
++        r.put("generadoPorIA", generadoPorIA);
++        r.put("fecha", LocalDateTime.now(HerramientasIA.ZONA));
++        return r;
++    }
++
++    public Map<String, Object> redactarComunicado(String tema, String tono, String detalles) {
++        if (tema == null || tema.isBlank()) {
++            throw new IllegalArgumentException("El tema es obligatorio");
++        }
++        String tonoFinal = tono == null || tono.isBlank() ? "cordial" : tono.trim();
++        String texto = null;
++        if (llm.disponible()) {
++            try {
++                texto = llm.completar(
++                        "Eres la administración de un conjunto residencial en Colombia y redactas comunicados para los residentes.",
++                        "Redacta un comunicado en tono " + tonoFinal + " sobre: " + tema.trim()
++                                + (detalles != null && !detalles.isBlank() ? "\nDetalles a incluir: " + detalles.trim() : "")
++                                + "\nMáximo 120 palabras, sin firma ni placeholders entre corchetes, listo para publicar.");
++            } catch (Exception e) {
++                log.warn("Fallo redacción de comunicado: {}", e.getMessage());
++            }
++        }
++        boolean porIA = texto != null && !texto.isBlank();
++        if (!porIA) {
++            texto = "Estimados residentes:\n\nLes informamos sobre " + tema.trim() + "."
++                    + (detalles != null && !detalles.isBlank() ? " " + detalles.trim() : "")
++                    + "\n\nAgradecemos su atención y colaboración.\n\nAdministración";
++        }
++        return Map.of("texto", texto.trim(), "generadoPorIA", porIA);
++    }
++
++    private Map<String, Object> leerJson(String texto) throws Exception {
++        if (texto == null) {
++            return null;
++        }
++        int inicio = texto.indexOf('{');
++        int fin = texto.lastIndexOf('}');
++        if (inicio < 0 || fin <= inicio) {
++            return null;
++        }
++        return json.readValue(texto.substring(inicio, fin + 1), new TypeReference<Map<String, Object>>() {
++        });
++    }
++
++    private Map<String, Object> analisisHeuristico(Queja q) {
++        String d = TextoIA.normalizar(q.getTipoQueja() + " " + q.getDescripcion());
++        String categoria = "GENERAL";
++        if (contiene(d, "violen", "agres", "golpe", "amenaz", "pelea")) categoria = "VIOLENCIA";
++        else if (contiene(d, "robo", "hurto", "sospech", "inseguri", "intrus")) categoria = "SEGURIDAD";
++        else if (contiene(d, "ruido", "musica", "fiesta", "bulla", "grito")) categoria = "RUIDO";
++        else if (contiene(d, "mascota", "perro", "gato", "excremento", "ladra")) categoria = "MASCOTA";
++        else if (contiene(d, "parque", "carro", "moto", "vehicul")) categoria = "PARQUEADERO";
++        else if (contiene(d, "basura", "aseo", "sucio", "olor")) categoria = "ASEO";
++        else if (contiene(d, "fuga", "gotera", "ascensor", "luz", "daño", "dano", "humedad")) categoria = "INFRAESTRUCTURA";
++        else if (contiene(d, "piscina", "gimnasio", "salon", "bbq")) categoria = "ZONAS_COMUNES";
++
++        String prioridad = "BAJA";
++        if (Set.of("VIOLENCIA", "SEGURIDAD").contains(categoria) || contiene(d, "gas", "incendio", "herido", "emergencia", "urgente")) {
++            prioridad = "ALTA";
++        } else if (Set.of("RUIDO", "MASCOTA", "PARQUEADERO", "INFRAESTRUCTURA").contains(categoria) || contiene(d, "siempre", "todos los dias", "reiterad")) {
++            prioridad = "MEDIA";
++        }
++        Map<String, Object> m = new HashMap<>();
++        m.put("categoria", categoria);
++        m.put("prioridad", prioridad);
++        m.put("resumen", TextoIA.recortar(q.getDescripcion(), 140));
++        m.put("respuestaSugerida", "Hemos recibido su reporte y la administración lo está revisando. "
++                + "Le informaremos sobre las acciones tomadas. Gracias por contribuir a la sana convivencia.");
++        return m;
++    }
++
++    @SuppressWarnings("unchecked")
++    private String resumenHeuristico(Map<String, Object> m) {
++        StringBuilder sb = new StringBuilder("Situación general:\n");
++        sb.append("- Residentes registrados: ").append(m.get("residentes")).append("\n");
++        sb.append("- Quejas por estado: ").append(m.get("quejasPorEstado")).append("\n");
++        sb.append("- Paquetes pendientes por entregar: ").append(m.get("paquetesPendientes")).append("\n");
++        sb.append("- Residentes sin pago aprobado en ").append(m.get("periodoActual")).append(": ").append(m.get("residentesEnMoraMes")).append("\n");
++        sb.append("\nAcciones sugeridas:\n");
++        Object alta = m.get("quejasAbiertasPrioridadAlta");
++        if (alta instanceof Number n && n.longValue() > 0) {
++            sb.append("- Atender primero las ").append(n).append(" quejas de prioridad alta.\n");
++        }
++        Map<String, Long> porCategoria = (Map<String, Long>) m.get("quejasAbiertasPorCategoria");
++        if (porCategoria != null && !porCategoria.isEmpty()) {
++            String top = porCategoria.entrySet().stream().max(Map.Entry.comparingByValue()).map(Map.Entry::getKey).orElse("");
++            sb.append("- Publicar un comunicado preventivo sobre ").append(top.toLowerCase().replace("_", " ")).append(", la categoría con más quejas abiertas.\n");
++        }
++        sb.append("- Enviar recordatorio de pago a los residentes pendientes del periodo.\n");
++        sb.append("\n(Resumen automático sin IA: configure IA_API_KEY para un análisis más completo.)");
++        return sb.toString();
++    }
++
++    private boolean contiene(String texto, String... claves) {
++        for (String c : claves) {
++            if (texto.contains(c)) {
++                return true;
++            }
++        }
++        return false;
++    }
++}
+diff --git a/src/main/java/com/example/APP/Service/ServiceImpl/QuejaServiceImpl.java b/src/main/java/com/example/APP/Service/ServiceImpl/QuejaServiceImpl.java
+index 8f05890..f77b9f7 100644
+--- a/src/main/java/com/example/APP/Service/ServiceImpl/QuejaServiceImpl.java
++++ b/src/main/java/com/example/APP/Service/ServiceImpl/QuejaServiceImpl.java
+@@ -6,6 +6,7 @@ import com.example.APP.Model.Usuario;
+ import com.example.APP.Repository.QuejaRepository;
+ import com.example.APP.Repository.UsuarioRepository;
+ import com.example.APP.Service.NotificacionService;
++import com.example.APP.Service.IaGestionService;
+ import com.example.APP.Service.QuejaService;
+ import org.springframework.beans.BeanWrapperImpl;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -37,6 +38,9 @@ public class QuejaServiceImpl implements QuejaService {
+     @Autowired
+     private UsuarioRepository usuarioRepository;
+ 
++    @Autowired
++    private IaGestionService iaGestionService;
++
+     @Override
+     public List<Queja> obtenerTodos() {
+         return quejaRepository.findAll();
+@@ -183,7 +187,9 @@ public class QuejaServiceImpl implements QuejaService {
+         queja.setFechaCreacion(fecha);
+         queja.setEstado(Queja.Estado.PENDIENTE);
+         
+-        return quejaRepository.save(queja);
++        Queja guardada = quejaRepository.save(queja);
++        iaGestionService.analizarQuejaAsync(guardada.getId());
++        return guardada;
+     }
+     
+     @Override
+diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
+index 08db9ba..c338e8a 100644
+--- a/src/main/resources/application.properties
++++ b/src/main/resources/application.properties
+@@ -50,6 +50,17 @@ server.tomcat.uri-encoding=UTF-8
+ server.tomcat.connection-timeout=90s
+ spring.mvc.async.request-timeout=90s
+ 
++# ASISTENTE IA
++# ia.proveedor: anthropic (Claude) u openai (cualquier API compatible: OpenAI, Gemini, Groq, Ollama)
++ia.proveedor=${IA_PROVEEDOR:anthropic}
++ia.api-key=${IA_API_KEY:}
++ia.modelo=${IA_MODELO:}
++ia.base-url=${IA_BASE_URL:}
++ia.max-tokens=${IA_MAX_TOKENS:1024}
++ia.limite-mensajes-hora=${IA_LIMITE_MENSAJES_HORA:40}
++ia.nombre-asistente=${IA_NOMBRE_ASISTENTE:Asistente del Conjunto}
++ia.nombre-conjunto=${IA_NOMBRE_CONJUNTO:el conjunto residencial}
++
+ # Actuator (health check de Render)
+ management.endpoints.web.exposure.include=health
+ management.endpoint.health.show-details=never
